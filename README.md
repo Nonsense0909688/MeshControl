@@ -1,147 +1,234 @@
 # MeshControl
 
-Lightweight, self-hosted control plane for a LAN cluster of Ollama instances:
-node health, cluster-wide model inventory, and a streaming-capable reverse proxy
-that routes requests to a node hosting the requested model.
+Run several [Ollama](https://ollama.com) machines on your LAN as **one cluster**.
 
-This is **Phase 1** (reliable core) of the roadmap. State is in memory.
+MeshControl gives you a single address to chat with and call. A request for a
+model goes to a node that has it, requests are spread across nodes (round-robin),
+and a built-in web UI shows every node, its CPU/RAM, its models, and lets you
+pull new models onto any node.
+
+It ships as **one binary with two roles**:
+
+| Role | Where it runs | What it does |
+|---|---|---|
+| `controller` | one machine | Web UI, API, node registry, and a streaming reverse proxy for Ollama |
+| `agent` | every machine running Ollama | Registers with the controller and sends a heartbeat (CPU, RAM, installed models) every few seconds. It never carries inference traffic. |
 
 ```
- client ──► controller :8000 ──► node A ollama :11434
-                 ▲   │ ──────► node B ollama :11434
-        heartbeat│   
-   agent A   agent B   (each agent only reports; it never carries inference traffic)
+ browser / your apps                      Ollama machines
+        │                          ┌────────────────────────────┐
+        ▼                          │  node-a   agent ─┐ Ollama  │
+ ┌──────────────┐  heartbeats      │           (5s)   │ :11434  │
+ │  controller  │◄─────────────────┤                  ▼         │
+ │  :8000       │                  └────────────────────────────┘
+ │  UI + API    │  proxied /api/chat, /api/generate, ...
+ │  + proxy     ├──────────────────────────────► node-a / node-b / ...
+ └──────────────┘        (streaming, straight to Ollama)
 ```
+
+> **Status:** this Go version is a port of the original Python
+> `controller.py` / `agent.py`. API shapes and behaviour are kept the same.
+> Run `go vet ./...` and `go build` once on your machine before deploying.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Requirements](#requirements)
+- [Building](#building)
+- [Configuration](#configuration)
+- [Using the cluster](#using-the-cluster)
+- [Web UI files](#web-ui-files)
+- [Project layout](#project-layout)
+- [More documentation](#more-documentation)
 
 ## Quick start
 
-```bash
-pip install -r requirements.txt
-export AGENT_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
-export ADMIN_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
-
-# central machine
-python controller.py
-
-# every Ollama machine (copy AGENT_TOKEN across)
-export CONTROLLER_URL=http://<controller-ip>:8000
-python agent.py
-```
-
-Ollama must listen on the LAN, e.g. `OLLAMA_HOST=0.0.0.0:11434`. If it only binds
-to localhost the agent reports `ollama_lan_reachable: false` and the node is skipped
-by automatic routing.
+**1. Build**
 
 ```bash
-H="Authorization: Bearer $ADMIN_TOKEN"
-curl -H "$H" localhost:8000/api/nodes
-curl -H "$H" localhost:8000/api/models
-curl -H "$H" localhost:8000/api/ollama/api/tags
-curl -H "$H" localhost:8000/api/ollama/api/generate \
-     -d '{"model":"qwen3.5:0.8b","prompt":"Hello"}'                 # auto-routed, streamed
-curl -H "$H" localhost:8000/api/nodes/nandiastra/ollama/api/chat \
-     -d '{"model":"qwen3.5:0.8b","messages":[{"role":"user","content":"Hi"}]}'
+go mod tidy
+go build -o meshcontrol .
 ```
 
-## API
+**2. Configure.** Copy the example and edit it. Both roles read the same kind of file.
 
-| Method | Path | Auth | Purpose |
+```bash
+cp .env.example .env
+```
+
+At minimum set `AGENT_TOKEN` (same value on the controller and every agent) and,
+on the controller, `ADMIN_TOKEN`. Generate strong values with:
+
+```bash
+openssl rand -base64 32
+```
+
+**3. Start the controller** (on the central machine):
+
+```bash
+# .env: MESHCONTROL_MODE=controller, WEB_DIR=./web, tokens set
+./meshcontrol
+# or explicitly
+./meshcontrol controller
+```
+
+**4. Start an agent** on each Ollama machine:
+
+```bash
+# .env: MESHCONTROL_MODE=agent
+#       CONTROLLER_URL=http://<controller-ip>:8000
+#       AGENT_TOKEN=<same token as the controller>
+./meshcontrol agent
+```
+
+**5. Make Ollama reachable from the LAN.** By default Ollama only listens on
+`127.0.0.1`. The controller then shows the node as `provider_unreachable`.
+Set `OLLAMA_HOST=0.0.0.0` for the Ollama service (see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)).
+
+**6. Open** `http://<controller-ip>:8000/` for the dashboard and `/chat` to talk to the cluster.
+
+## Requirements
+
+- **Go 1.22+** to build (uses `net/http` method/wildcard routing and `log/slog`).
+- **Ollama** on each agent machine.
+- Linux, macOS or Windows. The only third-party dependency is
+  [`gopsutil`](https://github.com/shirou/gopsutil) (agent CPU/RAM readings).
+- The controller and agents must reach each other over the network
+  (agent → controller, controller → every node's Ollama port).
+
+## Building
+
+```bash
+go build -o meshcontrol .                         # your platform
+GOOS=linux  GOARCH=arm64 go build -o meshcontrol-linux-arm64 .   # e.g. Raspberry Pi
+GOOS=windows GOARCH=amd64 go build -o meshcontrol.exe .
+make build        # same as the first line, see Makefile
+make cross        # linux amd64/arm64, darwin arm64, windows amd64 into ./dist
+```
+
+`CGO_ENABLED=0` works and gives a fully static binary.
+
+## Configuration
+
+Settings come from environment variables, optionally loaded from a `.env` file.
+
+- `./.env` is loaded automatically if present.
+- `--env-file PATH` or `ENV_FILE=PATH` loads a different file (and a missing file is then an error).
+- **Real environment variables always win over the file.**
+- `MESHCONTROL_MODE=controller|agent` lets you start with no argument.
+
+The most important variables:
+
+| Variable | Role | Default | Meaning |
 |---|---|---|---|
-| POST | `/api/agent/register` | agent | Create/refresh a node record |
-| POST | `/api/agent/heartbeat` | agent | Update metrics + models. `404 {"reregister":true}` if unknown |
-| GET | `/api/nodes`, `/api/nodes/<n>`, `/api/nodes/<n>/models` | admin | Node info (with computed `online`) |
-| GET | `/api/models` | admin | Every (model, node) pair + availability, size, parameters, quantization, family, digest, `modified_at` |
-| GET | `/api/ollama/api/tags` | admin | Aggregated tags from online nodes (cluster view, not native Ollama) |
-| POST | `/api/ollama/api/{generate,chat,embeddings,embed}` | admin | Auto-routed by `model` |
-| POST | `/api/nodes/<n>/pull` | admin | Start pulling `{"model": "..."}` on a node (202, job record) |
-| GET / DELETE | `/api/pulls`, `/api/pulls/<id>` | admin | Pull progress / cancel |
-| POST | `/api/nodes/<n>/ollama/api/{generate,chat,embeddings,embed}` | admin | Direct to a node |
-| GET | `/`, `/nodes`, `/nodes/<n>`, `/models`, `/models/<m>`, `/chat`, `/static/*` | none | Web UI (static, no data) |
-| GET | `/healthz` | none | Liveness |
+| `AGENT_TOKEN` | both | *(required)* | Shared secret agents use to talk to the controller |
+| `ADMIN_TOKEN` | controller | empty | Protects UI data, API and proxy. **Empty = open.** |
+| `CONTROLLER_URL` | agent | *(required)* | e.g. `http://10.0.0.5:8000` |
+| `WEB_DIR` | controller | `.` | Folder with the HTML pages and `static/` |
+| `CONTROLLER_HOST` / `CONTROLLER_PORT` | controller | `0.0.0.0` / `8000` | Listen address |
+| `NODE_ID` | agent | hostname | Name shown in the UI |
+| `OLLAMA_ADVERTISE_URL` | agent | auto | URL the controller uses to reach this node's Ollama |
 
-"admin" = `ADMIN_TOKEN` bearer (open if unset). The agent token never grants admin access.
+The full list with ranges, defaults and examples is in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
-## Web UI
+## Using the cluster
 
-Open `http://<controller-ip>:8000/`. Each page is its own static HTML file with its own script:
+### Web UI
 
-| URL | File | Page |
-|---|---|---|
-| `/` | `dashboard.html` | Overview: stats, cluster map, activity, CPU/RAM chart |
-| `/nodes` | `nodes.html` | All nodes, filter All / Online / Provider unreachable / Offline |
-| `/nodes/<n>` | `node.html` | One node: status banner, metrics, installed models (size, parameters, downloaded) |
-| `/models` | `models.html` | Cluster-wide model inventory (family, parameters, quantization, size, downloaded, nodes) and **Pull a model** |
-| `/models/<m>` | `model.html` | One model: every copy with size/date/digest, pull to another node, `curl` example |
-| `/chat` | `chat.html` | Streaming chat with markdown, code blocks, reasoning blocks; auto-routed or pinned (`?model=...&node=...`) |
+| Page | Purpose |
+|---|---|
+| `/` | Dashboard: cluster overview |
+| `/nodes`, `/nodes/<node>` | Node list and detail: status, CPU, RAM, models |
+| `/models`, `/models/<model>` | Models across the cluster and where they live; pull a model onto a node |
+| `/chat` | Streaming chat, auto-routed or pinned to one node |
 
-Shared code: `static/common.js` (shell, API, polling), `static/pulls.js`, `static/app.css`, `static/theme.js`.
-No build step, no dependencies, no inline scripts (CSP `script-src 'self'`). Pages contain no cluster data and all
-node-supplied text is inserted as plain text. History charts, the activity feed and the chat transcript are kept per browser tab.
+If `ADMIN_TOKEN` is set, the UI asks for it the first time it calls the API.
 
-### Node status
+### API (Ollama's own API behind one address)
 
-| Status | Colour | Meaning |
-|---|---|---|
-| Online | green | Heartbeat is fresh and Ollama is reachable from the LAN |
-| **Provider unreachable** | **orange** | The agent is heartbeating, but Ollama cannot be reached (not running, bound to 127.0.0.1, or firewalled). Skipped by routing; pulls are refused |
-| Offline | red | No heartbeat within `OFFLINE_AFTER` |
-
-The API exposes this as `status` (`online` / `provider_unreachable` / `offline`) on every node.
-
-### Pulling models
-
-Use **Pull a model** on `/models` (or "Pull to a node" on a model page). The controller tells the chosen node's Ollama to
-pull and tracks progress as a background job, so a download keeps running if you close the page; a sidebar indicator shows
-active downloads. Cancel from the UI, or `DELETE /api/pulls/<id>`. The model appears in the inventory after the node's next heartbeat.
-
-Only the model name is taken from the client; the upstream request is built by the controller. Names that start with a
-registry host must use one listed in `PULL_REGISTRIES` (default `registry.ollama.ai,hf.co,huggingface.co`).
-Pulling downloads many GB onto a node, so set `ADMIN_TOKEN`.
-
-## Behaviour worth knowing
-
-- **Online** = heartbeat within `OFFLINE_AFTER` (20 s). Computed on read; one record per node ID.
-- **Routing** (auto): model must be hosted by an *online* node reporting Ollama reachable.
-  `llama3` and `llama3:latest` match. Eligible nodes are rotated round-robin.
-  Unknown model → 404; known but no eligible node → 503.
-- **Failover**: only when the TCP connection to a node provably failed (request never sent).
-  Once any response byte is relayed, or a read times out, there is **no retry**, so inference is never replayed.
-  A mid-stream upstream failure cuts the connection so clients see an incomplete stream.
-- **Streaming**: upstream chunks are relayed as they arrive (NDJSON preserved).
-- **Controller restart**: agents get a 404 on their next heartbeat and re-register automatically.
-  Agents retry registration with exponential backoff (max 30 s).
-- Stale nodes (silent > `PURGE_AFTER`) are dropped.
-
-## Security
-
-- `AGENT_TOKEN` is required (no default, never in code); compared in constant time; never logged.
-- Registered `ollama_url` is the only upstream the proxy can reach. It must be a bare
-  `http(s)://IP:port` inside `ALLOWED_NODE_NETWORKS` (private ranges by default; link-local/cloud
-  metadata excluded). Credentials, paths, queries and hostnames are rejected. Only
-  `generate|chat|embeddings|embed` paths are proxied, and client `Authorization` headers are not forwarded.
-- With `ALLOW_HOSTNAMES=true`, DNS is resolved only at registration (DNS-rebinding caveat); prefer IPs.
-- Agent-reported metrics/reachability are advisory. Failover covers a node that lies about reachability.
-- A shared token means any holder can register as any node ID. Per-node credentials are Phase 4.
-- Set `ADMIN_TOKEN`, and firewall ports 8000 and 11434 to the LAN / controller only.
-- For anything past development, put it behind a production WSGI server and TLS:
-  `waitress-serve --threads=32 --call controller:create_app` (needs `AGENT_TOKEN` in env).
-
-## Tests
+Auto-routed chat (the controller picks a node that hosts the model):
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+curl -N http://CONTROLLER:8000/api/ollama/api/chat \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"model":"llama3.2:3b","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
 ```
 
-The suite includes a real fake-Ollama HTTP server, so chunked streaming, failover and
-header handling are tested over actual sockets.
+Pinned to a node:
 
-## Known limitations (by design for Phase 1)
+```bash
+curl -N http://CONTROLLER:8000/api/nodes/gpu-box/ollama/api/generate \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"model":"llama3.2:3b","prompt":"Why is the sky blue?"}'
+```
 
-In-memory state (lost on restart), no metrics history, no load-based scheduling,
-no model sync between nodes, single shared token.
+Pull a model onto a node (runs in the background):
 
-## Next
+```bash
+curl -X POST http://CONTROLLER:8000/api/nodes/gpu-box/pull \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"model":"qwen2.5:7b"}'
+curl http://CONTROLLER:8000/api/pulls -H "Authorization: Bearer $ADMIN_TOKEN"
+```
 
-Phase 2: SQLite persistence + metrics history. Phase 3: least-loaded routing, in-flight request
-tracking, node priorities. Phase 4: per-node credentials.
+Proxied endpoints: `generate`, `chat`, `embeddings`, `embed`. Everything is
+documented in [docs/API.md](docs/API.md).
+
+### How a request is routed
+
+1. The model name is normalised (`llama3` and `llama3:latest` are the same model).
+2. Nodes that are **online**, report Ollama as **LAN-reachable**, and host the model are eligible.
+3. Eligible nodes are rotated round-robin so consecutive requests spread out.
+4. If connecting to a node fails outright, the next eligible node is tried. Once a
+   request has reached a node it is **never replayed** elsewhere.
+
+The response header `X-MeshControl-Node` tells you which node answered.
+
+### Node states
+
+| State | Meaning |
+|---|---|
+| `online` | Recent heartbeat and Ollama reachable over the LAN |
+| `provider_unreachable` | Agent is alive, but Ollama can't be reached from the LAN (usually bound to `127.0.0.1`) |
+| `offline` | No heartbeat for `OFFLINE_AFTER` seconds (default 20) |
+
+## Web UI files
+
+The controller serves the UI from `WEB_DIR`; it does not embed it. Expected layout:
+
+```
+web/
+├── dashboard.html  nodes.html  node.html  models.html  model.html  chat.html
+└── static/
+    ├── app.css  theme.js  common.js  pulls.js
+    └── dashboard.js  nodes.js  node.js  models.js  model.js  chat.js
+```
+
+Only the files in that list are served from `/static/`. Pages are sent with a strict
+Content-Security-Policy (`script-src 'self'`, no inline scripts, no third-party hosts).
+
+## Project layout
+
+```
+main.go          entry point: picks controller or agent, loads .env
+dotenv.go        small .env parser
+agent.go         agent: register, heartbeat, Ollama inventory
+controller.go    controller config, validation, node registry
+server.go        controller HTTP routes, web serving, streaming proxy
+pulls.go         background model-pull jobs
+util.go          shared helpers
+.env.example     every setting with its default
+deploy/          systemd units, Dockerfile, docker-compose
+docs/            detailed documentation
+```
+
+## More documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how it works inside
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md): every setting
+- [docs/API.md](docs/API.md): every endpoint, request and response
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): systemd, Docker, TLS reverse proxy, upgrades
+- [docs/SECURITY.md](docs/SECURITY.md): threat model and hardening checklist
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): symptoms and fixes
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): code tour, testing, extending

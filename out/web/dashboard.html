@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshControl · Dashboard</title>
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-nav="dash">
+<div id="view">
+  <div class="hd">
+    <div><h1>Dashboard</h1><p>Live overview of your Ollama cluster</p></div>
+  </div>
+  <div id="alert"></div>
+  <div class="grid g4" id="stats"></div>
+  <div class="grid g2">
+    <section class="card"><h2>Cluster Overview <span id="clegend"></span></h2><div id="cluster"></div></section>
+    <section class="card"><h2>Recent Activity</h2><div id="acts"></div></section>
+  </div>
+  <div class="grid g2b">
+    <section class="card"><h2>Nodes <a href="/nodes">View all →</a></h2><div id="nodes"></div></section>
+    <section class="card"><h2>Models <a href="/models">View all →</a></h2><div id="models"></div></section>
+  </div>
+  <section class="card"><h2>CPU &amp; RAM (cluster average) <span id="chlegend"></span></h2><div id="chart"></div></section>
+</div>
+<script src="/static/common.js"></script>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

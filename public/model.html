@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshControl · Model</title>
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-nav="models">
+<div id="view">
+  <div id="nf" hidden></div>
+  <div id="content" hidden>
+    <div class="crumb"><a href="/models">Models</a> / <span id="crumbname"></span></div>
+    <div class="hd">
+      <div><h1><span id="title"></span><span id="badge"></span></h1><p id="sub"></p></div>
+      <div class="acts"><a class="btn pri" id="chatlink" href="/chat">Chat with this model</a></div>
+    </div>
+
+    <div class="grid g4" id="stats"></div>
+
+    <section class="card">
+      <h2>Copies on nodes</h2>
+      <div id="copies"></div>
+      <p class="hint" id="digestnote" hidden></p>
+    </section>
+
+    <section class="card">
+      <h2>Pull to a node</h2>
+      <form class="form" id="pullform" autocomplete="off">
+        <label class="grow">Download to
+          <select id="pn" aria-label="Node to pull to"></select>
+        </label>
+        <button class="pri" type="submit" id="pgo">Pull this model</button>
+      </form>
+      <p class="msg-err" id="perr" hidden></p>
+      <p class="hint">Pulling to a node that already has the model checks for a newer version.</p>
+      <div id="downloads"></div>
+    </section>
+
+    <section class="card">
+      <h2>Details</h2>
+      <div id="details"></div>
+    </section>
+
+    <section class="card">
+      <h2>Use it through the cluster</h2>
+      <pre id="curl"></pre>
+    </section>
+  </div>
+</div>
+<script src="/static/common.js"></script>
+<script src="/static/pulls.js"></script>
+<script src="/static/model.js"></script>
+</body>
+</html>

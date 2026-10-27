@@ -1,0 +1,47 @@
+# MeshControl settings. Loaded automatically from ./.env
+# (or: meshcontrol --env-file /path/to/file, or ENV_FILE=/path/to/file).
+# Real environment variables override anything in this file.
+# Quote values with spaces or '#':  KEY="value # not a comment"
+
+# Which role to run when no argument is given: controller | agent
+MESHCONTROL_MODE=controller
+LOG_LEVEL=INFO
+
+# ---------------------------------------------------------------------------
+# Shared secret. Must be identical on the controller and every agent.
+# ---------------------------------------------------------------------------
+AGENT_TOKEN=alpha
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
+# Protects the web UI/API/proxy. If empty, those endpoints are OPEN (trusted LAN only).
+ADMIN_TOKEN=alpha
+CONTROLLER_HOST=0.0.0.0
+CONTROLLER_PORT=8000
+# Folder containing dashboard.html, chat.html, ... and static/
+WEB_DIR=./web
+# Seconds without a heartbeat before a node is "offline" / forgotten
+OFFLINE_AFTER=20
+PURGE_AFTER=86400
+# Networks nodes may advertise (link-local / cloud metadata is excluded on purpose)
+ALLOWED_NODE_NETWORKS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7
+ALLOW_HOSTNAMES=false
+VERIFY_SOURCE_IP=false
+# Seconds. READ_TIMEOUT is the max silence between chunks from a node.
+CONNECT_TIMEOUT=5
+READ_TIMEOUT=600
+# Registries a node may be told to pull from
+PULL_REGISTRIES=registry.ollama.ai,hf.co,huggingface.co
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+CONTROLLER_URL=http://127.0.0.1:8000
+# Defaults to the machine's hostname
+#NODE_ID=gpu-box-1
+OLLAMA_LOCAL_URL=http://127.0.0.1:11434
+# URL the controller should use to reach Ollama; auto-detected if unset
+#OLLAMA_ADVERTISE_URL=http://192.168.1.20:11434
+OLLAMA_PORT=11434
+HEARTBEAT_INTERVAL=5

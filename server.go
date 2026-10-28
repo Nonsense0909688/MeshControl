@@ -1,6 +1,6 @@
 package main
 
-// Controller: HTTP API, web UI files, and the streaming Ollama reverse proxy.
+// Controller: HTTP API, web UI files, and streaming inference-provider proxies.
 
 import (
 	"bytes"
@@ -379,6 +379,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/ollama/api/{endpoint}", s.adminOnly(api(s.handleProxyAuto)))
 	mux.HandleFunc("POST /api/nodes/{node}/ollama/api/{endpoint}", s.adminOnly(api(s.handleProxyDirect)))
 	mux.HandleFunc("GET /api/ollama/api/tags", s.adminOnly(s.handleProxyTags))
+	// vLLM exposes an OpenAI-compatible API. This route is enabled only when
+	// VLLM_BASE_URL points to an explicitly configured, allowlisted self-hosted server.
+	mux.HandleFunc("POST /api/vllm/v1/{endpoint...}", s.adminOnly(api(s.handleVLLMProxy)))
+	mux.HandleFunc("GET /api/vllm/v1/models", s.adminOnly(s.handleVLLMModels))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { apiErr(w, "not found", http.StatusNotFound) })
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -756,6 +760,73 @@ func (s *Server) handleProxyTags(w http.ResponseWriter, r *http.Request) {
 		models = append(models, map[string]any{"name": m, "model": m, "nodes": nodes})
 	}
 	writeJSON(w, 200, map[string]any{"models": models})
+}
+
+// handleVLLMProxy adapts ModelMesh's provider routing to vLLM's OpenAI-compatible
+// REST API. It intentionally does not accept a client-supplied upstream URL.
+func (s *Server) handleVLLMProxy(w http.ResponseWriter, r *http.Request) error {
+	if s.cfg.VLLMBaseURL == "" {
+		apiErr(w, "vLLM provider is not configured (set VLLM_BASE_URL)", http.StatusServiceUnavailable)
+		return nil
+	}
+	endpoint := r.PathValue("endpoint")
+	if endpoint != "chat/completions" && endpoint != "completions" && endpoint != "embeddings" {
+		apiErr(w, "not found", http.StatusNotFound)
+		return nil
+	}
+	body, err := readBody(r, s.cfg.MaxBodyBytes)
+	if err != nil {
+		return err
+	}
+	if _, err := parseObject(body); err != nil {
+		return err
+	}
+	s.proxyConfiguredProvider(w, r, vLLMAdapter{BaseURL: s.cfg.VLLMBaseURL}, endpoint, body)
+	return nil
+}
+
+func (s *Server) handleVLLMModels(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.VLLMBaseURL == "" {
+		apiErr(w, "vLLM provider is not configured (set VLLM_BASE_URL)", http.StatusServiceUnavailable)
+		return
+	}
+	s.proxyConfiguredProvider(w, r, vLLMAdapter{BaseURL: s.cfg.VLLMBaseURL}, "models", nil)
+}
+
+func (s *Server) proxyConfiguredProvider(w http.ResponseWriter, r *http.Request, adapter ProviderAdapter, endpoint string, body []byte) {
+	s.metrics.proxyRequests.Add(1)
+	ctx, cancel := context.WithCancel(r.Context())
+	idle := newIdle(s.cfg.ReadTimeout, cancel)
+	defer cancel()
+	defer idle.stop()
+	upstreamURL, err := adapter.Endpoint(endpoint)
+	if err != nil {
+		apiErr(w, "invalid provider endpoint", http.StatusBadRequest)
+		return
+	}
+	method := http.MethodPost
+	if endpoint == "models" {
+		method = http.MethodGet
+	}
+	req, err := http.NewRequestWithContext(ctx, method, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		s.metrics.proxyErrors.Add(1)
+		apiErr(w, "could not construct provider request", http.StatusBadGateway)
+		return
+	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		s.metrics.proxyErrors.Add(1)
+		apiErr(w, "configured vLLM provider is unreachable", http.StatusBadGateway)
+		return
+	}
+	s.relay(w, r, resp, "vllm", idle, cancel)
 }
 
 // forward tries each candidate in order. It only moves to the next node when

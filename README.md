@@ -159,6 +159,22 @@ The full list with ranges, defaults and examples is in
 
 The UI asks for `ADMIN_TOKEN` the first time it calls the API. All API routes fail closed without a valid bearer token.
 
+### Self-hosted vLLM adapter
+
+ModelMesh can also proxy to one explicitly configured self-hosted vLLM server through its OpenAI-compatible API. Set `VLLM_BASE_URL` to the server base URL (for example `http://192.168.1.50:8000`) and include its port in `ALLOWED_NODE_PORTS` (for example `11434,8000`). The configured host must also be inside `ALLOWED_NODE_NETWORKS`; no client-supplied upstream URL is accepted.
+
+```bash
+curl http://CONTROLLER:8000/api/vllm/v1/models \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+curl -N http://CONTROLLER:8000/api/vllm/v1/chat/completions \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-vllm-model","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+The vLLM routes use the OpenAI-compatible request/response schema; the existing `/api/ollama/...` routes retain Ollama's native schema and clustered model-aware routing. vLLM is currently a configured single upstream, not part of the Ollama node scheduler.
+
 ### API (Ollama's own API behind one address)
 
 Auto-routed chat (the controller picks a node that hosts the model):

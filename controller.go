@@ -55,6 +55,7 @@ type ControllerConfig struct {
 	MaxConcurrentPulls        int
 	MaxConcurrentPullsPerNode int
 	PullRegistries            map[string]bool
+	VLLMBaseURL               string // optional self-hosted vLLM OpenAI-compatible endpoint
 }
 
 func parseNetworks(spec string) ([]*net.IPNet, error) {
@@ -213,6 +214,13 @@ func controllerConfigFromEnv() (ControllerConfig, error) {
 		return c, errors.New("ALLOWED_NODE_PORTS must contain at least one port")
 	}
 	c.AllowedNodePorts = ports
+	if raw := strings.TrimSpace(os.Getenv("VLLM_BASE_URL")); raw != "" {
+		base, urlErr := validateOllamaURL(raw, c)
+		if urlErr != nil {
+			return c, fmt.Errorf("VLLM_BASE_URL: %w", urlErr)
+		}
+		c.VLLMBaseURL = base
+	}
 	c.AllowHostnames, err = envBoolChecked("ALLOW_HOSTNAMES", false)
 	if err != nil {
 		return c, err

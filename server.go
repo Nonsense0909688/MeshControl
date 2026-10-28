@@ -677,10 +677,6 @@ func (s *Server) handleCancelPull(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProxyAuto(w http.ResponseWriter, r *http.Request) error {
 
-	if r.Header.Get("Content-Type") != "application/json" {
-		return fmt.Errorf("unsupported Content-Type: expected application/json")
-	}
-
 	endpoint := r.PathValue("endpoint")
 	if !proxyEndpoints[endpoint] {
 		apiErr(w, "not found", 404)

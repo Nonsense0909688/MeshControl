@@ -1,4 +1,5 @@
 # MeshControl
+[![Go checks](https://github.com/Nonsense0909688/MeshControl/actions/workflows/test.yml/badge.svg)](https://github.com/Nonsense0909688/MeshControl/actions/workflows/test.yml) 
 
 Run several [Ollama](https://ollama.com) machines on your LAN as **one cluster**.
 

@@ -55,35 +55,43 @@ string falls back to the default).
 |---|---|---|
 | `MESHCONTROL_MODE` | none | `controller` or `agent`; used when no argument is given |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN` or `ERROR` (Go `slog` levels). Logs go to stderr. |
-| `AGENT_TOKEN` | **required** | Shared secret. Must be identical on the controller and every agent. Generate one with `openssl rand -base64 32`. |
+| `AGENT_TOKEN` | **required in shared mode** | Shared secret identical on controller and every agent. Generate with `openssl rand -hex 32`. Mutually exclusive with `AGENT_TOKENS`. |
+| `AGENT_TOKENS` | unset | Optional controller-only per-node mode: comma-separated `node-id:secret` pairs. When set, leave controller `AGENT_TOKEN` blank; each agent sets `AGENT_TOKEN` to its own mapped secret. IDs and secrets must be unique; each secret is 32+ characters. |
 
 ## Controller settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ADMIN_TOKEN` | empty | Bearer token for the UI's API calls, node/model endpoints, pulls and the proxy. **Empty = those endpoints are open** (a warning is logged at start-up). Use a different value from `AGENT_TOKEN`. |
-| `CONTROLLER_HOST` | `0.0.0.0` | Listen address |
+| `ADMIN_TOKEN` | **required** | Bearer token for the UI API, node/model endpoints, pulls and proxy. Must be at least 32 characters and not a placeholder; requests fail closed if absent. Use a different value from the shared `AGENT_TOKEN` or every mapped `AGENT_TOKENS` secret. |
+| `CONTROLLER_HOST` | `127.0.0.1` | Listen address; set `0.0.0.0` to accept LAN connections. |
 | `CONTROLLER_PORT` | `8000` | Listen port |
-| `WEB_DIR` | `.` | Folder containing the `*.html` pages and `static/`. Start-up fails if the directory doesn't exist. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | unset | Optional native HTTPS certificate/key pair; both must be set and valid |
+| `ALLOW_INSECURE_HTTP` | `false` | Explicit opt-in for non-loopback plain HTTP; strongly prefer TLS or a reverse proxy |
+| `WEB_DIR` | `./web` | Folder containing the `*.html` pages and `static/`. Start-up fails if the directory doesn't exist. |
 | `OFFLINE_AFTER` | `20` | Seconds without a heartbeat before a node is `offline`. Keep it comfortably above `HEARTBEAT_INTERVAL` (≥ 3×). |
 | `PURGE_AFTER` | `86400` | Seconds without a heartbeat before a node is forgotten entirely |
-| `ALLOWED_NODE_NETWORKS` | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7` | Comma-separated CIDRs (or bare IPs) that a node's `ollama_url` may point into. Link-local (`169.254.0.0/16`, which includes cloud metadata) is excluded on purpose. |
+| `ALLOWED_NODE_NETWORKS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7` | Comma-separated CIDRs (or bare IPs) that node URLs may point into. Loopback, link-local and cloud-metadata ranges are excluded by default. |
+| `ALLOWED_NODE_PORTS` | `11434` | Comma-separated Ollama ports accepted during registration and rechecked for every upstream connection. Add custom Ollama ports explicitly. |
 | `ALLOW_HOSTNAMES` | `false` | Accept DNS names in `ollama_url`. When `false`, only IP literals are accepted. |
 | `VERIFY_SOURCE_IP` | `false` | Require the host in `ollama_url` to equal the IP the registration came from |
 | `CONNECT_TIMEOUT` | `5` | Seconds allowed to open a TCP connection to a node (proxy and pulls) |
 | `READ_TIMEOUT` | `600` | Seconds of *silence* tolerated from a node while proxying or pulling. Not a total deadline. |
 | `PULL_REGISTRIES` | `registry.ollama.ai,hf.co,huggingface.co` | Registries a pull request may name. Case-insensitive, comma-separated. |
+| `MAX_BODY_MB` | `8` | Maximum API request body in MiB (whole number from 1 to 64). |
+| `MAX_CONCURRENT_REQUESTS` | `256` | Maximum requests processed concurrently; excess requests receive `503`. |
+| `MAX_CONCURRENT_PULLS` | `4` | Maximum active model pulls across the controller. |
+| `MAX_CONCURRENT_PULLS_PER_NODE` | `1` | Maximum active pulls on one node (cannot exceed global limit). |
 
 ## Agent settings
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CONTROLLER_URL` | **required** | Base URL of the controller, e.g. `http://10.0.0.5:8000`. A trailing `/` is removed. `https://` works if you front the controller with TLS. |
+| `CONTROLLER_URL` | **required** | Base URL of the controller, e.g. `http://10.0.0.5:8000`. A trailing `/` is removed. `https://` works with native TLS or a TLS reverse proxy. |
 | `NODE_ID` | machine hostname | Name shown in the UI and used in `/api/nodes/<node>`. 1–64 characters: letters, digits, `.`, `_`, `-`; must start with a letter or digit. |
 | `OLLAMA_LOCAL_URL` | `http://127.0.0.1:11434` | Where the agent itself reaches Ollama (fallback probe) |
 | `OLLAMA_ADVERTISE_URL` | auto | URL the **controller** should use to reach this node's Ollama, e.g. `http://192.168.1.20:11434`. Auto-detected from the route to the controller if unset. |
 | `OLLAMA_PORT` | `11434` | Port used when building the auto-detected advertised URL |
-| `HEARTBEAT_INTERVAL` | `5` | Seconds between heartbeats (decimals allowed, must be > 0) |
+| `HEARTBEAT_INTERVAL` | `5` | Seconds between heartbeats (1–3600; decimals allowed) |
 
 > Set `OLLAMA_ADVERTISE_URL` explicitly if the machine has several network
 > interfaces, runs in a container, or sits behind NAT. The auto-detected address
@@ -93,7 +101,7 @@ string falls back to the default).
 
 | Type | Accepted |
 |---|---|
-| Seconds | Decimal numbers, e.g. `5`, `0.5`, `600`. Non-numeric, `NaN` or `Inf` → start-up error `invalid <NAME>`. |
+| Seconds | Most timeout settings accept decimals; each variable also has a documented range. Non-numeric, `NaN` or `Inf` values fail validation. |
 | Booleans | `1`, `true`, `yes`, `on` (case-insensitive) are true. Any other *set* value is false. Unset uses the default. |
 | Networks | `10.0.0.0/8`, `192.168.1.0/24`, `fd00::/8`, or a bare IP (treated as `/32` or `/128`). Invalid entries fail start-up. |
 | Lists | Comma-separated; whitespace around items is trimmed |
@@ -119,7 +127,7 @@ These are compiled in and not configurable:
 ```ini
 MESHCONTROL_MODE=controller
 AGENT_TOKEN=<openssl rand -base64 32>
-ADMIN_TOKEN=<a different openssl rand -base64 32>
+ADMIN_TOKEN=<a different openssl rand -hex 32>
 WEB_DIR=/opt/meshcontrol/web
 CONTROLLER_HOST=0.0.0.0
 CONTROLLER_PORT=8000
@@ -141,7 +149,8 @@ The default allow-list does not include `100.64.0.0/10`. Add it, keeping the
 defaults you still need:
 
 ```ini
-ALLOWED_NODE_NETWORKS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10
+ALLOWED_NODE_NETWORKS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10
+ALLOWED_NODE_PORTS=11434
 ```
 
 ### Quoted values

@@ -50,7 +50,7 @@ Two traffic paths exist and they never mix:
 | `main.go` | Parses `[--env-file PATH] <controller\|agent>`, loads the `.env` file, sets up `log/slog`, dispatches to `runController()` or `runAgent()`. |
 | `dotenv.go` | Dependency-free `.env` parser. Never overrides variables already present in the real environment. |
 | `agent.go` | Agent config, Ollama inventory (`/api/tags`), LAN-address discovery, register/heartbeat loop with exponential back-off. |
-| `controller.go` | Controller config, input validation, the in-memory node `Registry`, model-name normalisation and round-robin candidate selection. |
+| `controller.go` | Controller config, input validation, the in-memory node `Registry`, model-name normalisation and candidate discovery. |
 | `server.go` | HTTP routes, bearer-token auth, static UI serving, the streaming reverse proxy. |
 | `pulls.go` | `PullManager`: background `ollama pull` jobs with progress tracking and cancellation. |
 | `util.go` | Env helpers, `idleTimer`, small formatting/safety helpers. |
@@ -111,26 +111,28 @@ registry the next time anyone reads it.
 
 For an auto-routed request (`POST /api/ollama/api/{endpoint}`):
 
-1. The body is read (limit 64 MiB) and must be a JSON object with a non-empty
+1. The body is read (configurable limit, default 8 MiB and maximum 64 MiB) and must be a JSON object with a non-empty
    string `model`.
 2. `normModel` normalises the name: a name whose last path segment has no `:` gets
    `:latest` appended, so `llama3` equals `llama3:latest`. Names such as
    `hf.co/org/repo` are normalised the same way.
 3. **Hosting** nodes are those whose reported models match. **Eligible** nodes are
    the hosting ones that are `online` and LAN-reachable.
-4. The eligible list is rotated by a shared atomic counter, giving round-robin
-   across consecutive requests.
+4. Candidates are scored by reported CPU/RAM utilization and in-flight proxy
+   requests. The registry round-robin counter breaks ties between similarly loaded nodes.
 5. Outcomes:
    - nobody hosts the model → `404`;
    - hosted but nobody eligible → `503`;
-   - otherwise the request is forwarded to the first node in the rotated list.
+   - otherwise the request is forwarded to the first eligible node in the load-ordered candidate list.
 
 The pinned route (`/api/nodes/{node}/ollama/api/{endpoint}`) skips model lookup
 and sends the request to that one node, provided the node exists and is not
 `offline`.
 
-Routing is purely round-robin. CPU/RAM figures are displayed but not used to
-make routing decisions, and there is no concurrency or queue awareness.
+Routing is load-aware but intentionally lightweight: it combines agent-reported
+CPU/RAM percentages with active proxy requests, including streaming responses. It
+does not predict model load or token-generation speed, so measure real workloads
+before tuning the weights.
 
 ## The streaming proxy
 
@@ -197,7 +199,7 @@ All state is in memory:
 |---|---|---|
 | Node registry | yes | Agents get `404`, re-register, and the next heartbeat refills models |
 | Pull jobs | yes | In-flight pulls are aborted from the controller's side; Ollama itself may continue or resume on re-request |
-| Round-robin counter | yes | Irrelevant |
+| Round-robin tie-breaker counter | yes | Resets to zero |
 
 Agents hold no persistent state either. There is no database and nothing to
 back up apart from the `.env` files.
@@ -207,8 +209,9 @@ back up apart from the `.env` files.
 - `Registry` guards its map with one mutex; the round-robin counter is an atomic.
   Views handed out are copies, so callers never touch live records.
 - `PullManager` guards its job map with a mutex; each pull has its own goroutine.
-- The HTTP server uses Go's one-goroutine-per-connection model; proxy requests
-  use a shared `http.Client` (`MaxIdleConnsPerHost: 16`).
+- The HTTP server uses Go's one-goroutine-per-connection model with a bounded
+  request semaphore; proxy requests use a shared `http.Client` with bounded
+  per-host connections. In-flight proxy requests feed the load-aware scheduler.
 - Shutdown on `SIGINT`/`SIGTERM` waits up to 5 s for requests, then closes
   connections so long streams don't block exit.
 

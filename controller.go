@@ -24,7 +24,7 @@ const (
 	maxModelNameLen        = 256
 	agentBodyLimit         = 256 * 1024 // heartbeats/registrations are tiny
 	defaultPullRegistries  = "registry.ollama.ai,hf.co,huggingface.co"
-	defaultAllowedNetworks = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7"
+	defaultAllowedNetworks = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
 )
 
 var (
@@ -39,17 +39,22 @@ var (
 // ---- configuration --------------------------------------------------------
 
 type ControllerConfig struct {
-	AgentToken      string
-	AdminToken      string // if empty, read/proxy endpoints are open
-	OfflineAfter    time.Duration
-	PurgeAfter      time.Duration
-	AllowedNetworks []*net.IPNet
-	AllowHostnames  bool // accept DNS names in ollama_url
-	VerifySourceIP  bool // require ollama_url host == agent source IP
-	ConnectTimeout  time.Duration
-	ReadTimeout     time.Duration
-	MaxBodyBytes    int64
-	PullRegistries  map[string]bool
+	AgentToken                string            // shared credential; mutually exclusive with AgentTokens
+	AgentTokens               map[string]string // optional node ID -> unique credential
+	AdminToken                string            // required for read/proxy endpoints
+	OfflineAfter              time.Duration
+	PurgeAfter                time.Duration
+	AllowedNetworks           []*net.IPNet
+	AllowedNodePorts          map[int]bool
+	AllowHostnames            bool // accept DNS names in ollama_url
+	VerifySourceIP            bool // require ollama_url host == agent source IP
+	ConnectTimeout            time.Duration
+	ReadTimeout               time.Duration
+	MaxBodyBytes              int64
+	MaxConcurrentRequests     int
+	MaxConcurrentPulls        int
+	MaxConcurrentPullsPerNode int
+	PullRegistries            map[string]bool
 }
 
 func parseNetworks(spec string) ([]*net.IPNet, error) {
@@ -77,13 +82,87 @@ func parseNetworks(spec string) ([]*net.IPNet, error) {
 	return out, nil
 }
 
+func validateSecret(name, value string) error {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if len(value) < 32 {
+		return fmt.Errorf("%s must contain at least 32 characters; generate one with: openssl rand -hex 32", name)
+	}
+	for _, placeholder := range []string{"change-me", "replace-with", "your-token", "example-token", "changeme", "placeholder"} {
+		if strings.Contains(lower, placeholder) {
+			return fmt.Errorf("%s still contains a placeholder; set a unique random secret", name)
+		}
+	}
+	return nil
+}
+
+// parseAgentTokens parses AGENT_TOKENS as comma-separated node-id:secret pairs.
+// Tokens must be unique so one credential cannot authenticate as multiple nodes.
+func parseAgentTokens(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	tokenOwners := map[string]string{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		id, token, ok := strings.Cut(entry, ":")
+		id = strings.TrimSpace(id)
+		token = strings.TrimSpace(token)
+		if !ok {
+			return nil, fmt.Errorf("AGENT_TOKENS entry %q must be node-id:secret", entry)
+		}
+		if _, err := validateNodeID(id); err != nil {
+			return nil, fmt.Errorf("AGENT_TOKENS has invalid node ID %q", id)
+		}
+		if err := validateSecret("AGENT_TOKENS["+id+"]", token); err != nil {
+			return nil, err
+		}
+		if _, exists := out[id]; exists {
+			return nil, fmt.Errorf("AGENT_TOKENS repeats node ID %q", id)
+		}
+		if owner, exists := tokenOwners[token]; exists {
+			return nil, fmt.Errorf("AGENT_TOKENS reuses the same secret for %q and %q", owner, id)
+		}
+		out[id] = token
+		tokenOwners[token] = id
+	}
+	if len(out) == 0 {
+		return nil, errors.New("AGENT_TOKENS must contain at least one node-id:secret entry")
+	}
+	return out, nil
+}
+
 func controllerConfigFromEnv() (ControllerConfig, error) {
 	var c ControllerConfig
-	c.AgentToken = strings.TrimSpace(os.Getenv("AGENT_TOKEN"))
-	if c.AgentToken == "" {
-		return c, errors.New("AGENT_TOKEN environment variable is required")
+	sharedToken := strings.TrimSpace(os.Getenv("AGENT_TOKEN"))
+	rawAgentTokens := strings.TrimSpace(os.Getenv("AGENT_TOKENS"))
+	if rawAgentTokens != "" {
+		if sharedToken != "" {
+			return c, errors.New("set either AGENT_TOKEN or AGENT_TOKENS, not both")
+		}
+		var err error
+		c.AgentTokens, err = parseAgentTokens(rawAgentTokens)
+		if err != nil {
+			return c, err
+		}
+	} else {
+		c.AgentToken = sharedToken
+		if err := validateSecret("AGENT_TOKEN", c.AgentToken); err != nil {
+			return c, err
+		}
 	}
 	c.AdminToken = strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
+	if err := validateSecret("ADMIN_TOKEN", c.AdminToken); err != nil {
+		return c, err
+	}
+	if c.AgentToken != "" && c.AgentToken == c.AdminToken {
+		return c, errors.New("AGENT_TOKEN and ADMIN_TOKEN must be different secrets")
+	}
+	for node, token := range c.AgentTokens {
+		if token == c.AdminToken {
+			return c, fmt.Errorf("AGENT_TOKENS secret for %q must differ from ADMIN_TOKEN", node)
+		}
+	}
 	for _, f := range []struct {
 		key string
 		def float64
@@ -98,16 +177,73 @@ func controllerConfigFromEnv() (ControllerConfig, error) {
 		if err != nil {
 			return c, err
 		}
+		if v <= 0 || v > 365*24*60*60 {
+			return c, fmt.Errorf("%s must be greater than 0 and at most one year", f.key)
+		}
 		*f.dst = secs(v)
+	}
+	if c.OfflineAfter < 5*time.Second || c.OfflineAfter > 10*time.Minute {
+		return c, errors.New("OFFLINE_AFTER must be between 5 and 600 seconds")
+	}
+	if c.PurgeAfter < c.OfflineAfter {
+		return c, errors.New("PURGE_AFTER must be greater than or equal to OFFLINE_AFTER")
+	}
+	if c.ConnectTimeout < time.Second || c.ConnectTimeout > time.Minute {
+		return c, errors.New("CONNECT_TIMEOUT must be between 1 and 60 seconds")
+	}
+	if c.ReadTimeout < time.Second || c.ReadTimeout > 24*time.Hour {
+		return c, errors.New("READ_TIMEOUT must be between 1 second and 24 hours")
 	}
 	nets, err := parseNetworks(envOr("ALLOWED_NODE_NETWORKS", defaultAllowedNetworks))
 	if err != nil {
 		return c, err
 	}
 	c.AllowedNetworks = nets
-	c.AllowHostnames = envBool("ALLOW_HOSTNAMES", false)
-	c.VerifySourceIP = envBool("VERIFY_SOURCE_IP", false)
-	c.MaxBodyBytes = 64 * 1024 * 1024
+	ports := map[int]bool{}
+	for _, raw := range strings.Split(envOr("ALLOWED_NODE_PORTS", "11434"), ",") {
+		if raw = strings.TrimSpace(raw); raw != "" {
+			p, parseErr := strconv.Atoi(raw)
+			if parseErr != nil || p < 1 || p > 65535 {
+				return c, fmt.Errorf("invalid ALLOWED_NODE_PORTS entry %q", raw)
+			}
+			ports[p] = true
+		}
+	}
+	if len(ports) == 0 {
+		return c, errors.New("ALLOWED_NODE_PORTS must contain at least one port")
+	}
+	c.AllowedNodePorts = ports
+	c.AllowHostnames, err = envBoolChecked("ALLOW_HOSTNAMES", false)
+	if err != nil {
+		return c, err
+	}
+	c.VerifySourceIP, err = envBoolChecked("VERIFY_SOURCE_IP", false)
+	if err != nil {
+		return c, err
+	}
+	bodyMB, err := envFloat("MAX_BODY_MB", 8)
+	if err != nil || bodyMB < 1 || bodyMB > 64 {
+		return c, errors.New("MAX_BODY_MB must be between 1 and 64")
+	}
+	c.MaxBodyBytes = int64(bodyMB * 1024 * 1024)
+	if bodyMB != math.Trunc(bodyMB) {
+		return c, errors.New("MAX_BODY_MB must be a whole number")
+	}
+	concurrent, err := envFloat("MAX_CONCURRENT_REQUESTS", 256)
+	if err != nil || concurrent < 1 || concurrent > 10000 || concurrent != math.Trunc(concurrent) {
+		return c, errors.New("MAX_CONCURRENT_REQUESTS must be a whole number between 1 and 10000")
+	}
+	c.MaxConcurrentRequests = int(concurrent)
+	pulls, err := envFloat("MAX_CONCURRENT_PULLS", 4)
+	if err != nil || pulls < 1 || pulls > 128 || pulls != math.Trunc(pulls) {
+		return c, errors.New("MAX_CONCURRENT_PULLS must be a whole number between 1 and 128")
+	}
+	c.MaxConcurrentPulls = int(pulls)
+	perNode, err := envFloat("MAX_CONCURRENT_PULLS_PER_NODE", 1)
+	if err != nil || perNode < 1 || perNode > pulls || perNode != math.Trunc(perNode) {
+		return c, errors.New("MAX_CONCURRENT_PULLS_PER_NODE must be a whole number between 1 and MAX_CONCURRENT_PULLS")
+	}
+	c.MaxConcurrentPullsPerNode = int(perNode)
 	c.PullRegistries = map[string]bool{}
 	for _, r := range strings.Split(envOr("PULL_REGISTRIES", defaultPullRegistries), ",") {
 		if r = strings.ToLower(strings.TrimSpace(r)); r != "" {
@@ -169,7 +305,7 @@ func validateOllamaURL(v any, cfg ControllerConfig) (string, error) {
 	port := 0
 	if p := u.Port(); p != "" {
 		n, perr := strconv.Atoi(p)
-		if perr != nil || n < 0 || n > 65535 {
+		if perr != nil || n < 1 || n > 65535 {
 			return "", verr("ollama_url is malformed")
 		}
 		port = n
@@ -204,6 +340,9 @@ func validateOllamaURL(v any, cfg ControllerConfig) (string, error) {
 		if u.Scheme == "https" {
 			port = 443
 		}
+	}
+	if len(cfg.AllowedNodePorts) > 0 && !cfg.AllowedNodePorts[port] {
+		return "", verr("ollama_url port %d is not in ALLOWED_NODE_PORTS", port)
 	}
 	shown := host
 	if strings.Contains(host, ":") {
@@ -287,7 +426,7 @@ func validateModelDetails(v any) (map[string]ModelDetail, error) {
 			Digest: txt("digest"), Family: txt("family"), ParameterSize: txt("parameter_size"),
 			QuantizationLevel: txt("quantization_level"), Format: txt("format"),
 		}
-		if f, ok := item["size"].(float64); ok && f >= 0 && f == math.Trunc(f) {
+		if f, ok := item["size"].(float64); ok && f >= 0 && f < float64(math.MaxInt64) && f == math.Trunc(f) {
 			n := int64(f)
 			d.Size = &n
 		}
@@ -361,6 +500,7 @@ type nodeRec struct {
 	models    []string
 	details   map[string]ModelDetail
 	lastSeen  time.Time
+	sourceIP  string // peer IP that authenticated this node identity
 }
 
 type Registry struct {
@@ -377,26 +517,47 @@ func NewRegistry(cfg ControllerConfig, clock func() time.Time) *Registry {
 
 // Register creates or refreshes a node record. Returns true if newly created.
 func (r *Registry) Register(node, ollamaURL string) bool {
+	created, _ := r.RegisterFrom(node, ollamaURL, "")
+	return created
+}
+
+// RegisterFrom binds a node identity to the authenticated peer address. A live
+// node cannot be silently taken over from a different source address.
+func (r *Registry) RegisterFrom(node, ollamaURL, sourceIP string) (bool, error) {
 	now := r.clock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.nodes[node]
 	if !ok {
-		r.nodes[node] = &nodeRec{node: node, url: ollamaURL, models: []string{}, details: map[string]ModelDetail{}, lastSeen: now}
-		return true
+		r.nodes[node] = &nodeRec{node: node, url: ollamaURL, models: []string{}, details: map[string]ModelDetail{}, lastSeen: now, sourceIP: sourceIP}
+		return true, nil
+	}
+	if sourceIP != "" && rec.sourceIP != "" && rec.sourceIP != sourceIP && now.Sub(rec.lastSeen) <= r.cfg.OfflineAfter {
+		return false, verr("node identity is already registered from another source address")
+	}
+	if sourceIP != "" && (rec.sourceIP == "" || now.Sub(rec.lastSeen) > r.cfg.OfflineAfter) {
+		rec.sourceIP = sourceIP
 	}
 	rec.url = ollamaURL
 	rec.lastSeen = now
-	return false
+	return false, nil
 }
 
 // Heartbeat updates an existing record. Returns false if the node is unknown.
 func (r *Registry) Heartbeat(node string, cpu, ram float64, reachable bool, models []string, details map[string]ModelDetail) bool {
+	ok, _ := r.HeartbeatFrom(node, "", cpu, ram, reachable, models, details)
+	return ok
+}
+
+func (r *Registry) HeartbeatFrom(node, sourceIP string, cpu, ram float64, reachable bool, models []string, details map[string]ModelDetail) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rec, ok := r.nodes[node]
 	if !ok {
-		return false
+		return false, nil
+	}
+	if sourceIP != "" && rec.sourceIP != "" && rec.sourceIP != sourceIP {
+		return false, verr("node heartbeat source address does not match its registration")
 	}
 	kept := map[string]ModelDetail{}
 	for _, m := range models {
@@ -405,9 +566,9 @@ func (r *Registry) Heartbeat(node string, cpu, ram float64, reachable bool, mode
 		}
 	}
 	rec.cpu, rec.ram, rec.reachable = &cpu, &ram, reachable
-	rec.models, rec.details = models, kept
+	rec.models, rec.details = append([]string(nil), models...), kept
 	rec.lastSeen = r.clock()
-	return true
+	return true, nil
 }
 
 func (r *Registry) view(rec *nodeRec, now time.Time) NodeView {

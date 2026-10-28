@@ -1,9 +1,6 @@
 # Security
 
-MeshControl is designed for a **trusted LAN**. It authenticates with shared
-bearer tokens over plain HTTP by default and has no user accounts. This
-document describes what it protects against, what it does not, and how to
-harden a deployment.
+MeshControl is designed for a **trusted LAN**. It defaults to loopback-only HTTP, requires strong bearer tokens, and has no user accounts. LAN deployments should use native HTTPS or a TLS-terminating reverse proxy. This document describes what it protects against, what it does not, and how to harden a deployment.
 
 ## Contents
 
@@ -26,8 +23,8 @@ harden a deployment.
 
 | Boundary | Trust |
 |---|---|
-| Controller ↔ operators/clients | Protected by `ADMIN_TOKEN` (if set) |
-| Controller ↔ agents | Protected by `AGENT_TOKEN` |
+| Controller ↔ operators/clients | Protected by the required `ADMIN_TOKEN`; API requests fail closed if it is missing |
+| Controller ↔ agents | Protected by shared `AGENT_TOKEN` or unique per-node `AGENT_TOKENS` |
 | Controller ↔ Ollama | **No authentication**; Ollama's API is unauthenticated, so the network path must be trusted |
 | Agent ↔ Ollama | Local/LAN, unauthenticated |
 
@@ -36,19 +33,19 @@ node attempting to make the controller reach places it shouldn't (SSRF); a
 malicious web page or script in the admin's browser; a malformed or hostile
 request body.
 
-**Out of scope:** an attacker who can read network traffic (without TLS they
-can read tokens and prompts); an attacker with code execution on the controller
+**Out of scope:** an attacker who can read network traffic when TLS is not enabled (they can
+read tokens and prompts); an attacker with code execution on the controller
 or on an Ollama host; denial of service by a legitimate token holder.
 
 ## What the code enforces
 
 ### Authentication
 
-- Agent endpoints require `AGENT_TOKEN`. Node, model, pull and proxy endpoints
-  require `ADMIN_TOKEN` **when it is set**. Comparisons use
-  `crypto/subtle.ConstantTimeCompare`.
-- With `ADMIN_TOKEN` empty those endpoints are open and a warning is logged at
-  start-up.
+- Agent endpoints require either the shared `AGENT_TOKEN` or a unique credential from `AGENT_TOKENS` (per-node mode binds each credential to its configured node ID). Node, model, pull and proxy endpoints
+  always require `ADMIN_TOKEN`; an empty or invalid token cannot open the API.
+  Every configured secret must be at least 32 characters and non-placeholder.
+- Comparisons use `crypto/subtle.ConstantTimeCompare`. The HTTP listener defaults
+  to `127.0.0.1`; set `CONTROLLER_HOST=0.0.0.0` intentionally for LAN access.
 - `/healthz`, the HTML pages and `/static/*` are unauthenticated by design;
   pages contain no cluster data.
 
@@ -61,11 +58,17 @@ controller will connect there. `validateOllamaURL` therefore:
 - rejects credentials, paths, queries, fragments;
 - requires an IP literal unless `ALLOW_HOSTNAMES=true`;
 - requires **every** resolved address to lie inside `ALLOWED_NODE_NETWORKS`
-  (default: loopback and private ranges only; link-local and cloud-metadata
-  addresses are excluded);
+  (default: private LAN ranges only; loopback, link-local and cloud metadata
+  are excluded);
+- restricts the destination to `ALLOWED_NODE_PORTS` (default: 11434);
 - normalises to `scheme://host:port`, so later requests can't smuggle a path;
-- optionally (`VERIFY_SOURCE_IP=true`) requires the URL host to equal the
-  registering connection's source IP.
+- re-resolves and re-checks DNS answers at connection time to mitigate DNS
+  rebinding, and disables ambient HTTP proxy settings for node traffic;
+- binds an active node ID to its registration peer IP and verifies heartbeat
+  source IP consistency; a node moving to a new IP must re-register after its prior
+  heartbeat ages beyond `OFFLINE_AFTER`;
+- optionally (`VERIFY_SOURCE_IP=true`) requires the URL host (or one of its
+  resolved addresses when hostnames are explicitly enabled) to match the peer.
 
 ### Proxy hardening
 
@@ -73,7 +76,13 @@ controller will connect there. `validateOllamaURL` therefore:
   path is built from that allow-list, never from client input.
 - The client's `Authorization` header is never forwarded to Ollama.
 - Requests are never replayed on another node after a connection was made.
-- Request bodies are capped at 64 MiB (agents: 256 KiB).
+- JSON request bodies default to 8 MiB (`MAX_BODY_MB`, max 64 MiB); agents are
+  capped at 256 KiB. A 30-second server read timeout limits slow request bodies.
+- HTTP concurrency is bounded (`MAX_CONCURRENT_REQUESTS`); active model pulls
+  have global and per-node limits. Upstream pull progress frames are capped at
+  1 MiB each.
+- Upstream connections are limited to allowlisted networks and ports, with
+  capped connection pools and no automatic redirect following.
 
 ### Pull hardening
 
@@ -109,48 +118,44 @@ tokens and URLs don't leak into logs.
 
 ## Known limitations
 
-- **No TLS.** The controller speaks plain HTTP. Tokens and prompts cross the LAN
-  in clear text unless you terminate TLS in front (see
-  [DEPLOYMENT.md](DEPLOYMENT.md#tls-with-a-reverse-proxy)).
-- **Single shared admin role.** Anyone with `ADMIN_TOKEN` can chat, pull models
-  and cancel pulls. There are no per-user tokens, roles or audit trail.
-- **A shared `AGENT_TOKEN` lets anyone holding it register as a node** (from an
-  allowed network). The controller then sends prompts to that node. Treat the
-  token like a credential, restrict `ALLOWED_NODE_NETWORKS`, and consider
-  `VERIFY_SOURCE_IP=true`. That option doesn't work behind NAT or a proxy that
-  changes the source address.
-- **Hostnames are resolved once, at registration.** With `ALLOW_HOSTNAMES=true`
-  a DNS change afterwards (rebinding) is not re-checked. Leave it `false`
-  unless you need it.
+- **TLS is opt-in.** Native HTTPS is available with `TLS_CERT_FILE` and
+  `TLS_KEY_FILE`, or terminate TLS in a reverse proxy. Non-loopback plain HTTP
+  is rejected unless `ALLOW_INSECURE_HTTP=true` is explicitly set.
+- **Single shared admin role.** Anyone with `ADMIN_TOKEN` can chat, pull models,
+  and cancel pulls. There are no per-user tokens or role-based permissions;
+  operational audit events are ordinary process logs, not a tamper-proof audit log.
+- **Shared-token mode gives every agent the same authority.** A holder of the
+  shared `AGENT_TOKEN` can register identities from an allowed network. Use
+  `AGENT_TOKENS` for unique node-bound secrets; also restrict
+  `ALLOWED_NODE_NETWORKS` and optionally enable `VERIFY_SOURCE_IP` where NAT is
+  not involved.
 - **Ollama is unauthenticated.** Anyone on the LAN who can reach a node's port
   can use it directly, bypassing the controller. Use host firewalls to limit
   the Ollama port to the controller (and the node itself).
-- **No rate limiting or quotas.** A token holder can saturate nodes or start
-  many pulls.
+- **No request-rate limiting per identity.** Concurrency and pull limits protect
+  controller resources, but a valid admin can still submit sustained workloads.
+  Put an authenticated rate limiter at a TLS reverse proxy if required.
 - **CSP allows inline styles** (`style-src 'unsafe-inline'`).
 - **In-memory only.** Registry and pull state are not persisted.
-- **Admin token in the browser.** The UI asks for `ADMIN_TOKEN` and uses it from
-  the page; how it is stored client-side is determined by the UI code in
-  `static/common.js`, which was not part of the reviewed sources here.
+- **Admin token in the browser.** The operator enters `ADMIN_TOKEN` into the UI;
+  do not use a shared browser profile on an untrusted machine.
 
 ## Hardening checklist
 
-1. Generate two different strong tokens (`openssl rand -base64 32`) for
-   `AGENT_TOKEN` and `ADMIN_TOKEN`. Never keep the `change-me-*` placeholders.
-2. Always set `ADMIN_TOKEN` on anything other than a throwaway lab.
-3. Put the controller behind a TLS reverse proxy; bind it to `127.0.0.1`
-   (`CONTROLLER_HOST`) if the proxy is on the same host.
+1. Generate strong secrets (`openssl rand -hex 32`) for the agent credential(s) and a distinct `ADMIN_TOKEN`. For stronger isolation, configure unique `AGENT_TOKENS` entries per node. Never keep placeholders.
+2. `ADMIN_TOKEN` is mandatory; requests fail closed if it is missing or weak.
+3. Use native HTTPS (`TLS_CERT_FILE`/`TLS_KEY_FILE`) or a TLS reverse proxy.
+   Non-loopback plain HTTP is rejected unless `ALLOW_INSECURE_HTTP=true` is explicitly set.
 4. Firewall each Ollama port so only the controller can reach it.
 5. Narrow `ALLOWED_NODE_NETWORKS` to your real node subnet(s), e.g.
-   `192.168.1.0/24`.
+   `192.168.1.0/24`, and keep `ALLOWED_NODE_PORTS` limited to Ollama ports.
 6. Keep `ALLOW_HOSTNAMES=false`. Enable `VERIFY_SOURCE_IP=true` where nodes
-   register directly (no NAT).
+   register directly (no NAT or proxy that changes peer IPs).
 7. Trim `PULL_REGISTRIES` to registries you trust.
 8. Run the controller and agents as unprivileged users (systemd examples in
    [DEPLOYMENT.md](DEPLOYMENT.md)). `.env` files should be mode `600`.
 9. Don't commit `.env`; add it to `.gitignore`.
-10. Rotate tokens if a machine is lost or retired: change `AGENT_TOKEN` on the
-    controller and all agents, then restart them.
+10. Rotate tokens if a machine is lost or retired. In per-node mode, replace only that node's `AGENT_TOKENS` entry and its agent token; in shared mode, change `AGENT_TOKEN` on the controller and all agents.
 11. Keep Go toolchain and `gopsutil` current when rebuilding.
 
 ## Token handling

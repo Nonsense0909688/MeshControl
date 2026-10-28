@@ -2,4 +2,6 @@
 meshcontrol
 meshcontrol.exe
 /out/
-meshcontrol.zip
+/dist/
+coverage.out
+*.test

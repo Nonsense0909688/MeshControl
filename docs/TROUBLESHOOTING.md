@@ -51,7 +51,7 @@ not just `127.0.0.1`. Then test from the **controller**.
 | Symptom | Cause / fix |
 |---|---|
 | Agent log: `registration failed error=...` repeating | Agent can't reach `CONTROLLER_URL`. Check IP/port, firewall, that the controller is listening on a LAN address (`CONTROLLER_HOST`). Retries back off up to 30 s. |
-| Agent log: `controller rejected our token; check AGENT_TOKEN` | `AGENT_TOKEN` differs between agent and controller (watch for trailing spaces or old `.env`). Real environment variables override `.env`, so check both. |
+| Agent log: `controller rejected our token; check AGENT_TOKEN` | The agent credential does not match the controller configuration. In shared mode compare `AGENT_TOKEN`; in per-node mode ensure the controller maps `NODE_ID` to the exact token held by that agent. Real environment variables override `.env`, so check both. |
 | Agent log: `registration rejected status=400 ...` | Controller validation failed; the body text says why. See below. |
 | Agent log: `heartbeat failed` intermittently | Network trouble, or controller overloaded. If frequent, raise `OFFLINE_AFTER`. |
 | Agent log: `controller does not know us (restarted?); re-registering` | Normal after a controller restart or a purge. |
@@ -88,9 +88,9 @@ These are `400` responses from `POST /api/agent/register`:
 | `401 unauthorized` | Missing/wrong `ADMIN_TOKEN`. Header format: `Authorization: Bearer <token>`. |
 | `413 request entity too large` | Body over 64 MiB (usually large base64 images) |
 | Stream cuts off mid-answer | The node failed after streaming began; the controller deliberately aborts instead of retrying elsewhere. Retry the request. |
-| Stream arrives all at once | A reverse proxy is buffering. Disable buffering (see [DEPLOYMENT.md](DEPLOYMENT.md#tls-with-a-reverse-proxy)). |
+| Stream arrives all at once | A reverse proxy is buffering. Disable buffering (see [DEPLOYMENT.md](DEPLOYMENT.md#tls-with-native-https-or-a-reverse-proxy)). |
 | Which node answered? | Look at the `X-MeshControl-Node` response header (`curl -i`) |
-| Requests don't spread across nodes | Only nodes that host the model **and** are `online` take part; round-robin needs ≥ 2 eligible. Check `GET /api/models` for `available`. |
+| Requests don't spread across nodes | Only nodes that host the model **and** are `online` take part; load-aware routing spreads requests when multiple eligible nodes exist. Check `GET /api/models` for `available`. |
 
 ## Pull problems
 
@@ -131,7 +131,7 @@ These are `400` responses from `POST /api/agent/register`:
 | `invalid HEARTBEAT_INTERVAL` | Must be a number > 0 |
 | `WEB_DIR not found dir=...` | Create/point to the web folder |
 | `listen tcp ...: bind: address already in use` | Another process uses the port; change `CONTROLLER_PORT` |
-| `ADMIN_TOKEN is not set` (warning) | The API is open. Set a token unless that's intended. |
+| `ADMIN_TOKEN must contain at least 32 characters` | Generate a strong token with `openssl rand -hex 32`; the controller refuses weak/missing tokens. |
 
 ## Getting help
 

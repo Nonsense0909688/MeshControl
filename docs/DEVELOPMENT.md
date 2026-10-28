@@ -40,21 +40,19 @@ instances; for UI development, a fake Ollama is enough.
 
 ```bash
 # terminal 1: controller
-cat > .env <<'ENV'
-AGENT_TOKEN=dev-agent
-ADMIN_TOKEN=dev-admin
-WEB_DIR=./web
-ENV
+AGENT_TOKEN="$(openssl rand -hex 32)"
+ADMIN_TOKEN="$(openssl rand -hex 32)"
+printf 'AGENT_TOKEN=%s\nADMIN_TOKEN=%s\nALLOWED_NODE_NETWORKS=127.0.0.1/32,::1/128,10.0.0.0/8\nWEB_DIR=./web\n' \
+  "$AGENT_TOKEN" "$ADMIN_TOKEN" > .env
 ./meshcontrol controller
 
-# terminal 2: agent (talks to your local Ollama)
-AGENT_TOKEN=dev-agent CONTROLLER_URL=http://127.0.0.1:8000 NODE_ID=local-1 \
-  ./meshcontrol agent
+# terminal 2: agent (reads AGENT_TOKEN from the same .env)
+CONTROLLER_URL=http://127.0.0.1:8000 NODE_ID=local-1 ./meshcontrol agent
 ```
 
 On a single machine the auto-detected advertised address will be the loopback
 or LAN IP; if the controller reports `provider_unreachable`, set
-`OLLAMA_ADVERTISE_URL=http://127.0.0.1:11434` (loopback is in the default
+`OLLAMA_ADVERTISE_URL=http://127.0.0.1:11434` (for local development, explicitly add loopback to
 `ALLOWED_NODE_NETWORKS`).
 
 To simulate nodes without Ollama, run a tiny HTTP server that answers
@@ -87,7 +85,7 @@ Request flow for a proxied chat: `Handler()` route →
 | `NodeView`, `ModelDetail` | `controller.go` | JSON shapes returned by the API |
 | `validateOllamaURL` | `controller.go` | SSRF gate for agent-supplied URLs |
 | `normModel` | `controller.go` | `llama3` → `llama3:latest` normalisation |
-| `CandidatesFor` | `controller.go` | Hosting/eligible lists + round-robin rotation |
+| `CandidatesFor` / `orderCandidates` | `controller.go` / `server.go` | Eligible nodes plus load-aware ordering; round-robin tie-break |
 | `Server.Handler` | `server.go` | Route table (Go 1.22 `ServeMux` patterns) |
 | `api(fn)` | `server.go` | Maps returned errors to JSON responses (`validationError` → 400, `errTooLarge` → 413, else 500) |
 | `forward`, `relay` | `server.go` | Fail-over on dial errors; streamed copy to client |
@@ -96,41 +94,35 @@ Request flow for a proxied chat: `Handler()` route →
 
 ## Testing
 
-The sources contain no `_test.go` files yet. The design makes testing
-straightforward:
+The maintained suite lives in Go `*_test.go` files and covers configuration,
+input validation, authentication, malformed and oversized bodies, registry
+state transitions, peer-IP binding, URL/network/port allowlists, proxy routing
+and streaming, redirects, failover, model pulls and cancellation, concurrency
+limits, load-aware candidate ordering, fuzz targets, and race-heavy HTTP/registry
+access. Benchmarks cover registry snapshots, JSON parsing, and health handlers.
 
-- **Inject the clock.** `NewRegistry(cfg, clock)` and `NewPullManager(cfg,
-  clock)` take a `func() time.Time`, so state transitions (`online` →
-  `offline` → purged) can be tested without sleeping.
-- **Validators are pure.** `validateNodeID`, `validateOllamaURL` (with IP
-  literals), `validateModels`, `validateModelDetails`, `validatePullModel`,
-  `parseNetworks`, `normModel`, `parseEnvValue` all take plain inputs.
-- **Handlers via `httptest`.** `NewServer(cfg, webDir).Handler()` returns an
-  `http.Handler`; drive it with `httptest.NewRecorder`. For the proxy, point a
-  registered node's `ollama_url` at an `httptest.Server` bound to `127.0.0.1`
-  (inside the default allowed networks).
-- **Fake Ollama** for pull tests: an `httptest.Server` that writes NDJSON lines
-  (`{"status":"pulling x","digest":"d","total":100,"completed":50}` …
-  `{"status":"success"}`) and flushes between them.
-
-Suggested first cases:
-
-1. `normModel`: `llama3` → `llama3:latest`; `hf.co/org/repo` → `hf.co/org/repo:latest`;
-   `host:5000/foo` → `host:5000/foo:latest`.
-2. `validateOllamaURL`: rejects `http://169.254.169.254:80`, `http://u:p@10.0.0.1`,
-   `http://10.0.0.1/x`, `ftp://10.0.0.1`; accepts `http://10.0.0.1:11434`.
-3. Registry status transitions with a fake clock.
-4. Round-robin: three requests across two eligible nodes alternate.
-5. Proxy: first candidate refuses connections → second serves and
-   `X-MeshControl-Node` shows it; a mid-stream failure is **not** retried.
-6. Pull: duplicate start returns `409`; cancel ends in `cancelled`.
-
-Run with the race detector, since the registry and pull manager are
-concurrent:
+Run the main checks before a release:
 
 ```bash
+go test ./...
 go test -race ./...
+go vet ./...
+go test -run '^$' -bench . ./...
 ```
+
+To fuzz the validation boundaries for longer periods:
+
+```bash
+go test -fuzz FuzzValidateNodeID -fuzztime 30s
+go test -fuzz FuzzParseObject -fuzztime 30s
+go test -fuzz FuzzValidateOllamaURL -fuzztime 30s
+go test -fuzz FuzzParseNetworks -fuzztime 30s
+go test -fuzz FuzzValidatePercent -fuzztime 30s
+```
+
+`make test`, `make test-race`, `make vet`, `make bench`, and `make cross` are
+convenience targets. A GitHub Actions workflow runs tests, the race detector,
+vet, and a build on pushes and pull requests.
 
 ## Extending MeshControl
 

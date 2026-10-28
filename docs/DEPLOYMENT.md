@@ -14,7 +14,7 @@ upgrades.
 - [Install the binary and web files](#install-the-binary-and-web-files)
 - [systemd](#systemd)
 - [Docker](#docker)
-- [TLS with a reverse proxy](#tls-with-a-reverse-proxy)
+- [TLS with native HTTPS or a reverse proxy](#tls-with-native-https-or-a-reverse-proxy)
 - [Firewall](#firewall)
 - [Upgrades](#upgrades)
 - [Backups and state](#backups-and-state)
@@ -149,7 +149,7 @@ controller does not matter.
 
 ## Docker
 
-The binary is statically linkable (`CGO_ENABLED=0`), so images can be tiny.
+The binary is statically linkable (`CGO_ENABLED=0`), so images can be tiny. The controller binds to loopback by default, which is safe for native processes but is not reachable through Docker port publishing. Set `CONTROLLER_HOST=0.0.0.0` inside the container and configure native TLS, or keep the container on a private network behind a TLS reverse proxy. Do not publish plain HTTP to an untrusted network.
 
 `Dockerfile`
 
@@ -166,6 +166,8 @@ COPY --from=build /meshcontrol /meshcontrol
 COPY web /web
 ENV WEB_DIR=/web
 EXPOSE 8000
+# Configure CONTROLLER_HOST=0.0.0.0 and TLS_CERT_FILE/TLS_KEY_FILE at runtime
+# for native HTTPS, or use a private bridge and a TLS reverse proxy.
 ENTRYPOINT ["/meshcontrol"]
 CMD ["controller"]
 ```
@@ -193,13 +195,18 @@ Notes:
   the container can reach.
 - Inside a container, `CONTROLLER_HOST` should stay `0.0.0.0`; restrict exposure
   with the published port (`127.0.0.1:8000:8000`) if a proxy runs on the host.
+  For this reverse-proxy topology, explicitly set `ALLOW_INSECURE_HTTP=true` in
+  the container environment; keep the published port loopback-only so the proxy
+  is the only external path. Prefer native TLS if the service is directly exposed.
 - The `distroless` image has no shell; `.env` is injected via `env_file`, so no
   `.env` file is needed inside the image.
 
-## TLS with a reverse proxy
+## TLS with native HTTPS or a reverse proxy
 
-The controller has no built-in TLS. Terminate TLS in a reverse proxy and bind
-the controller to loopback (`CONTROLLER_HOST=127.0.0.1`).
+Native HTTPS is supported with `TLS_CERT_FILE` and `TLS_KEY_FILE`. Alternatively,
+terminate TLS in a reverse proxy and bind the controller to loopback
+(`CONTROLLER_HOST=127.0.0.1`). For Docker behind a host proxy, see the note above
+about loopback-only port publishing and `ALLOW_INSECURE_HTTP=true` inside the container.
 
 Important proxy settings: **disable response buffering** (streaming chat), and
 use a **long read timeout** (generation can pause while a model loads).

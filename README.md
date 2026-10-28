@@ -3,7 +3,7 @@
 Run several [Ollama](https://ollama.com) machines on your LAN as **one cluster**.
 
 MeshControl gives you a single address to chat with and call. A request for a
-model goes to a node that has it, requests are spread across nodes (round-robin),
+model goes to a node that has it, requests are routed using reported CPU/RAM load and active requests (round-robin breaks ties),
 and a built-in web UI shows every node, its CPU/RAM, its models, and lets you
 pull new models onto any node.
 
@@ -26,9 +26,7 @@ It ships as **one binary with two roles**:
  └──────────────┘        (streaming, straight to Ollama)
 ```
 
-> **Status:** this Go version is a port of the original Python
-> `controller.py` / `agent.py`. API shapes and behaviour are kept the same.
-> Run `go vet ./...` and `go build` once on your machine before deploying.
+> **Security defaults:** the controller binds to loopback and fails closed when required credentials are missing or weak. For LAN access, use native HTTPS or a TLS reverse proxy; do not expose plain HTTP to untrusted networks. Run the test suite and `go vet ./...` before deploying.
 
 ## Contents
 
@@ -56,12 +54,16 @@ go build -o meshcontrol .
 cp .env.example .env
 ```
 
-At minimum set `AGENT_TOKEN` (same value on the controller and every agent) and,
-on the controller, `ADMIN_TOKEN`. Generate strong values with:
+In shared mode, set `AGENT_TOKEN` to the same random value on the controller and every agent, and set a different `ADMIN_TOKEN`. For per-node isolation, set `AGENT_TOKEN=` and configure `AGENT_TOKENS=node-a:<secret>,node-b:<secret>` on the controller; each agent then uses only its own mapped secret. Every secret must be at least 32 characters and must not be a placeholder. Generate each independently with:
 
 ```bash
-openssl rand -base64 32
+openssl rand -hex 32
 ```
+
+In `AGENT_TOKENS`, each `node-id:secret` entry is generated independently; the agent on that node sets its matching secret as `AGENT_TOKEN` and the matching `NODE_ID`.
+
+For direct LAN access, set `CONTROLLER_HOST=0.0.0.0` and configure `TLS_CERT_FILE` plus `TLS_KEY_FILE` (native HTTPS). With a same-host reverse proxy, keep `CONTROLLER_HOST=127.0.0.1` and let the proxy handle HTTPS. Non-loopback plaintext HTTP is rejected unless you deliberately set `ALLOW_INSECURE_HTTP=true` for a trusted internal lab only. `WEB_DIR=./web` is the default. Change `ALLOWED_NODE_NETWORKS`
+and `ALLOWED_NODE_PORTS` only to the private subnet(s) and Ollama port(s) you use.
 
 **3. Start the controller** (on the central machine):
 
@@ -76,8 +78,9 @@ openssl rand -base64 32
 
 ```bash
 # .env: MESHCONTROL_MODE=agent
-#       CONTROLLER_URL=http://<controller-ip>:8000
-#       AGENT_TOKEN=<same token as the controller>
+#       CONTROLLER_URL=https://<controller-host>:8000 (native TLS)
+#       AGENT_TOKEN=<shared token, or this node's mapped secret>
+#       NODE_ID=<matching node-id when using AGENT_TOKENS>
 ./meshcontrol agent
 ```
 
@@ -86,7 +89,7 @@ openssl rand -base64 32
 Set `OLLAMA_HOST=0.0.0.0` for the Ollama service (see
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)).
 
-**6. Open** `http://<controller-ip>:8000/` for the dashboard and `/chat` to talk to the cluster.
+**6. Open** `https://<controller-host>:8000/` for the dashboard and `/chat` to talk to the cluster when using native HTTPS. When using a reverse proxy, open its HTTPS URL instead. A loopback-only controller is not directly reachable from other machines.
 
 ## Requirements
 
@@ -117,16 +120,25 @@ Settings come from environment variables, optionally loaded from a `.env` file.
 - `--env-file PATH` or `ENV_FILE=PATH` loads a different file (and a missing file is then an error).
 - **Real environment variables always win over the file.**
 - `MESHCONTROL_MODE=controller|agent` lets you start with no argument.
+- `meshcontrol version` prints build metadata.
+- `meshcontrol check-config controller|agent` validates configuration without starting.
+- `meshcontrol doctor controller|agent` validates settings and probes the configured services.
 
 The most important variables:
 
 | Variable | Role | Default | Meaning |
 |---|---|---|---|
-| `AGENT_TOKEN` | both | *(required)* | Shared secret agents use to talk to the controller |
-| `ADMIN_TOKEN` | controller | empty | Protects UI data, API and proxy. **Empty = open.** |
+| `AGENT_TOKEN` | controller + agent | *(required in shared mode)* | Shared secret; in per-node mode agents set their own mapped secret and the controller sets `AGENT_TOKENS` |
+| `AGENT_TOKENS` | controller | unset | Optional unique `node-id:secret` pairs for per-node agent authentication |
+| `ADMIN_TOKEN` | controller | *(required)* | Protects UI API, node/model endpoints, pulls and inference proxy; missing/weak secrets fail closed. |
 | `CONTROLLER_URL` | agent | *(required)* | e.g. `http://10.0.0.5:8000` |
-| `WEB_DIR` | controller | `.` | Folder with the HTML pages and `static/` |
-| `CONTROLLER_HOST` / `CONTROLLER_PORT` | controller | `0.0.0.0` / `8000` | Listen address |
+| `WEB_DIR` | controller | `./web` | Folder with the HTML pages and `static/` |
+| `CONTROLLER_HOST` / `CONTROLLER_PORT` | controller | `127.0.0.1` / `8000` | Listen address/port; non-loopback listeners require TLS or `ALLOW_INSECURE_HTTP=true`. |
+| `ALLOWED_NODE_PORTS` | controller | `11434` | Ollama ports allowed for registered nodes and outbound proxy/pull connections. |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | controller | unset | Enable native HTTPS with a valid cert/key pair. |
+| `MAX_CONCURRENT_REQUESTS` | controller | `256` | Bounded active HTTP requests; overflow returns `503`. |
+| `MAX_BODY_MB` | controller | `8` | Maximum JSON request body (1–64 MiB). |
+| `MAX_CONCURRENT_PULLS` / `_PER_NODE` | controller | `4` / `1` | Global and per-node active pull limits. |
 | `NODE_ID` | agent | hostname | Name shown in the UI |
 | `OLLAMA_ADVERTISE_URL` | agent | auto | URL the controller uses to reach this node's Ollama |
 
@@ -144,7 +156,7 @@ The full list with ranges, defaults and examples is in
 | `/models`, `/models/<model>` | Models across the cluster and where they live; pull a model onto a node |
 | `/chat` | Streaming chat, auto-routed or pinned to one node |
 
-If `ADMIN_TOKEN` is set, the UI asks for it the first time it calls the API.
+The UI asks for `ADMIN_TOKEN` the first time it calls the API. All API routes fail closed without a valid bearer token.
 
 ### API (Ollama's own API behind one address)
 
@@ -179,7 +191,7 @@ documented in [docs/API.md](docs/API.md).
 
 1. The model name is normalised (`llama3` and `llama3:latest` are the same model).
 2. Nodes that are **online**, report Ollama as **LAN-reachable**, and host the model are eligible.
-3. Eligible nodes are rotated round-robin so consecutive requests spread out.
+3. Eligible nodes are scored by reported CPU/RAM utilization and active in-flight requests; round-robin rotation breaks ties.
 4. If connecting to a node fails outright, the next eligible node is tried. Once a
    request has reached a node it is **never replayed** elsewhere.
 
@@ -215,13 +227,27 @@ main.go          entry point: picks controller or agent, loads .env
 dotenv.go        small .env parser
 agent.go         agent: register, heartbeat, Ollama inventory
 controller.go    controller config, validation, node registry
-server.go        controller HTTP routes, web serving, streaming proxy
-pulls.go         background model-pull jobs
-util.go          shared helpers
-.env.example     every setting with its default
-deploy/          systemd units, Dockerfile, docker-compose
-docs/            detailed documentation
+server.go         controller HTTP routes, web serving, streaming proxy
+pulls.go          background model-pull jobs
+*_test.go         unit, integration, security, concurrency and fuzz tests
+Makefile          build, test, race, vet, benchmark and cross-build targets
+.env.example      example configuration and secure defaults
+.github/workflows/test.yml  CI test, race, vet and build workflow
+docs/             configuration, API, security and deployment documentation
 ```
+
+## Testing and CLI diagnostics
+
+Run the unit, integration, concurrency, and fuzz-seed tests with:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go test -run '^$' -bench . ./...
+```
+
+Fuzz the input-validation boundaries with `go test -fuzz FuzzValidateOllamaURL -fuzztime 30s` (or another `Fuzz...` target). `make test` and `make test-race` are convenience targets. In a configured environment, run `./meshcontrol check-config controller` before starting and `./meshcontrol doctor agent` on a node.
 
 ## More documentation
 

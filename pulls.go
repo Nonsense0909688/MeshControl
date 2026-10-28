@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"sort"
 	"sync"
@@ -57,21 +56,55 @@ type PullManager struct {
 }
 
 func NewPullManager(cfg ControllerConfig, clock func() time.Time) *PullManager {
-	tr := &http.Transport{DialContext: (&net.Dialer{Timeout: cfg.ConnectTimeout}).DialContext}
-	return &PullManager{cfg: cfg, clock: clock, client: &http.Client{Transport: tr}, jobs: map[string]*pullEntry{}}
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = 5 * time.Second
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 10 * time.Minute
+	}
+	if cfg.MaxConcurrentPulls <= 0 {
+		cfg.MaxConcurrentPulls = 4
+	}
+	if cfg.MaxConcurrentPullsPerNode <= 0 {
+		cfg.MaxConcurrentPullsPerNode = 1
+	}
+	return &PullManager{cfg: cfg, clock: clock, client: &http.Client{Transport: newSafeTransport(cfg), CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, jobs: map[string]*pullEntry{}}
 }
 
-// Start begins a pull. ok is false if the same pull is already running.
+// Start begins a pull. ok is false if it is duplicate or a concurrency limit is reached.
 func (pm *PullManager) Start(node, url, model string) (PullJob, bool) {
+	job, ok, _ := pm.StartDetailed(node, url, model)
+	return job, ok
+}
+
+// StartDetailed returns a reason for refusing a pull: duplicate, global_limit,
+// node_limit, or random_failure.
+func (pm *PullManager) StartDetailed(node, url, model string) (PullJob, bool, string) {
 	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	active, onNode := 0, 0
 	for _, e := range pm.jobs {
-		if e.job.State == "running" && e.job.Node == node && normModel(e.job.Model) == normModel(model) {
-			pm.mu.Unlock()
-			return PullJob{}, false
+		if e.job.State != "running" {
+			continue
+		}
+		active++
+		if e.job.Node == node {
+			onNode++
+		}
+		if e.job.Node == node && normModel(e.job.Model) == normModel(model) {
+			return PullJob{}, false, "duplicate"
 		}
 	}
-	idb := make([]byte, 6)
-	_, _ = rand.Read(idb)
+	if active >= pm.cfg.MaxConcurrentPulls {
+		return PullJob{}, false, "global_limit"
+	}
+	if onNode >= pm.cfg.MaxConcurrentPullsPerNode {
+		return PullJob{}, false, "node_limit"
+	}
+	idb := make([]byte, 16)
+	if _, err := rand.Read(idb); err != nil {
+		return PullJob{}, false, "random_failure"
+	}
 	jid := hex.EncodeToString(idb)
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &pullEntry{job: PullJob{
@@ -80,9 +113,8 @@ func (pm *PullManager) Start(node, url, model string) (PullJob, bool) {
 	}, cancel: cancel}
 	pm.jobs[jid] = e
 	snap := e.job
-	pm.mu.Unlock()
 	go pm.run(ctx, cancel, jid, url, model)
-	return snap, true
+	return snap, true, ""
 }
 
 func (pm *PullManager) Snapshot() []PullJob {
@@ -192,6 +224,23 @@ func pullErrorText(resp *http.Response) string {
 	return fmt.Sprintf("node returned HTTP %d", resp.StatusCode)
 }
 
+func readPullLine(rd *bufio.Reader, max int) ([]byte, error) {
+	var out []byte
+	for {
+		part, err := rd.ReadSlice('\n')
+		if len(out)+len(part) > max {
+			return nil, errors.New("pull progress frame exceeded 1 MiB")
+		}
+		out = append(out, part...)
+		if err == nil || (errors.Is(err, io.EOF) && len(out) > 0) {
+			return out, nil
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return out, err
+		}
+	}
+}
+
 func (pm *PullManager) stream(ctx context.Context, idle *idleTimer, jid, url, model string) (bool, error) {
 	// The body is built here, never forwarded from the client.
 	body, _ := json.Marshal(map[string]any{"model": model, "stream": true})
@@ -213,7 +262,7 @@ func (pm *PullManager) stream(ctx context.Context, idle *idleTimer, jid, url, mo
 	succeeded := false
 	rd := bufio.NewReaderSize(resp.Body, 64*1024)
 	for {
-		line, rerr := rd.ReadBytes('\n')
+		line, rerr := readPullLine(rd, 1<<20)
 		idle.touch()
 		if len(bytes.TrimSpace(line)) > 0 {
 			var frame map[string]any
@@ -225,9 +274,9 @@ func (pm *PullManager) stream(ctx context.Context, idle *idleTimer, jid, url, mo
 				digest := str(frame, "digest")
 				total, _ := frame["total"].(float64)
 				done, _ := frame["completed"].(float64)
-				if digest != "" && total > 0 && total == math.Trunc(total) {
+				if digest != "" && total > 0 && total < float64(math.MaxInt64) && total == math.Trunc(total) {
 					c := int64(0)
-					if done >= 0 && done == math.Trunc(done) {
+					if done >= 0 && done <= total && done < float64(math.MaxInt64) && done == math.Trunc(done) {
 						c = int64(done)
 					}
 					layers[digest] = [2]int64{int64(total), c}

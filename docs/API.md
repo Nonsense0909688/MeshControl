@@ -24,21 +24,24 @@ Bodies and responses are JSON unless noted.
 - Timestamps (`last_seen`, `started_at`, `finished_at`, `modified_at`) are Unix
   epoch **seconds** as floating-point numbers.
 - Model names are compared after normalisation: `llama3` ≡ `llama3:latest`.
-- Examples assume `ADMIN_TOKEN` is set. If it is empty, drop the
-  `Authorization` header.
+- Examples require a valid `ADMIN_TOKEN`. Protected routes fail closed if the token is missing or invalid; never drop the `Authorization` header.
 
 ## Authentication
 
 | Group | Token | Header |
 |---|---|---|
-| Agent endpoints | `AGENT_TOKEN` | `Authorization: Bearer <token>` |
-| Nodes, models, pulls, proxy | `ADMIN_TOKEN` (no check when `ADMIN_TOKEN` is empty) | `Authorization: Bearer <token>` |
+| Agent endpoints | Shared `AGENT_TOKEN` or mapped per-node `AGENT_TOKENS` secret | `Authorization: Bearer <token>` |
+| Nodes, models, pulls, proxy | Required `ADMIN_TOKEN` | `Authorization: Bearer <token>` |
 | `/healthz`, web UI pages, `/static/*` | none | |
 
 A missing or wrong token returns `401 {"error":"unauthorized"}`. Token
 comparison is constant-time.
 
 ## Health
+
+### `GET /api/metrics`
+
+Requires `ADMIN_TOKEN`. Returns low-cardinality Prometheus text metrics for total/active/rejected HTTP requests, proxy requests/errors/active streams, and known/online nodes. It intentionally does not expose node names, prompts, tokens, or other high-cardinality labels.
 
 ### `GET /healthz`
 
@@ -65,7 +68,7 @@ Used by the agent; documented for custom agents and debugging. Body limit
 | Field | Rules |
 |---|---|
 | `node` | 1–64 chars `[A-Za-z0-9._-]`, first char alphanumeric |
-| `ollama_url` | `http`/`https`; IP literal (or hostname if `ALLOW_HOSTNAMES=true`); host inside `ALLOWED_NODE_NETWORKS`; no credentials, path, query or fragment. A missing port defaults to 80/443. With `VERIFY_SOURCE_IP=true` the host must equal the caller's IP. |
+| `ollama_url` | `http`/`https`; IP literal (or hostname if `ALLOW_HOSTNAMES=true`); host inside `ALLOWED_NODE_NETWORKS`; no credentials, path, query or fragment. The port must be listed in `ALLOWED_NODE_PORTS` (a missing port defaults to 80/443 and is normally rejected by the default allowlist). With `VERIFY_SOURCE_IP=true` the host must equal the caller's IP. |
 
 Response: `201` for a new node, `200` when refreshing an existing one:
 

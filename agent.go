@@ -45,12 +45,12 @@ type AgentConfig struct {
 
 func agentConfigFromEnv() (AgentConfig, error) {
 	token := strings.TrimSpace(os.Getenv("AGENT_TOKEN"))
-	controller := strings.TrimRight(strings.TrimSpace(os.Getenv("CONTROLLER_URL")), "/")
-	if token == "" {
-		return AgentConfig{}, errors.New("AGENT_TOKEN environment variable is required")
+	if err := validateSecret("AGENT_TOKEN", token); err != nil {
+		return AgentConfig{}, err
 	}
-	if controller == "" {
-		return AgentConfig{}, errors.New("CONTROLLER_URL environment variable is required")
+	controller := strings.TrimRight(strings.TrimSpace(os.Getenv("CONTROLLER_URL")), "/")
+	if err := validateServiceBaseURL("CONTROLLER_URL", controller); err != nil {
+		return AgentConfig{}, err
 	}
 	nodeID := envOr("NODE_ID", "")
 	if nodeID == "" {
@@ -60,23 +60,52 @@ func agentConfigFromEnv() (AgentConfig, error) {
 		}
 		nodeID = h
 	}
+	if _, err := validateNodeID(nodeID); err != nil {
+		return AgentConfig{}, fmt.Errorf("invalid NODE_ID: %w", err)
+	}
 	port, err := strconv.Atoi(envOr("OLLAMA_PORT", "11434"))
-	if err != nil {
-		return AgentConfig{}, fmt.Errorf("invalid OLLAMA_PORT: %w", err)
+	if err != nil || port < 1 || port > 65535 {
+		return AgentConfig{}, errors.New("OLLAMA_PORT must be between 1 and 65535")
 	}
 	hb, err := strconv.ParseFloat(envOr("HEARTBEAT_INTERVAL", "5"), 64)
-	if err != nil || hb <= 0 {
-		return AgentConfig{}, errors.New("invalid HEARTBEAT_INTERVAL")
+	if err != nil || math.IsNaN(hb) || math.IsInf(hb, 0) || hb < 1 || hb > 3600 {
+		return AgentConfig{}, errors.New("HEARTBEAT_INTERVAL must be between 1 and 3600 seconds")
+	}
+	localURL := strings.TrimRight(strings.TrimSpace(envOr("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434")), "/")
+	if err := validateServiceBaseURL("OLLAMA_LOCAL_URL", localURL); err != nil {
+		return AgentConfig{}, err
+	}
+	advertiseURL := strings.TrimRight(strings.TrimSpace(envOr("OLLAMA_ADVERTISE_URL", "")), "/")
+	if advertiseURL != "" {
+		if err := validateServiceBaseURL("OLLAMA_ADVERTISE_URL", advertiseURL); err != nil {
+			return AgentConfig{}, err
+		}
 	}
 	return AgentConfig{
 		ControllerURL:     controller,
 		Token:             token,
 		NodeID:            nodeID,
-		OllamaLocalURL:    strings.TrimRight(envOr("OLLAMA_LOCAL_URL", "http://127.0.0.1:11434"), "/"),
-		AdvertiseURL:      strings.TrimRight(envOr("OLLAMA_ADVERTISE_URL", ""), "/"),
+		OllamaLocalURL:    localURL,
+		AdvertiseURL:      advertiseURL,
 		OllamaPort:        port,
 		HeartbeatInterval: time.Duration(hb * float64(time.Second)),
 	}, nil
+}
+
+// validateServiceBaseURL accepts an HTTP(S) origin only. Endpoints are added by
+// the program, so embedded paths/credentials/query strings are rejected.
+func validateServiceBaseURL(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return fmt.Errorf("%s must be an http(s) base URL without credentials, paths, query or fragment", name)
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("%s has an invalid port", name)
+		}
+	}
+	return nil
 }
 
 // ---- model summaries ------------------------------------------------------
@@ -123,7 +152,7 @@ func summarizeModel(entry map[string]any) ModelInfo {
 		QuantizationLevel: str(details, "quantization_level"),
 		Format:            str(details, "format"),
 	}
-	if f, ok := entry["size"].(float64); ok && f >= 0 && f == math.Trunc(f) {
+	if f, ok := entry["size"].(float64); ok && f >= 0 && f < float64(math.MaxInt64) && f == math.Trunc(f) {
 		n := int64(f)
 		out.Size = &n
 	}
@@ -154,11 +183,13 @@ type Agent struct {
 
 func NewAgent(cfg AgentConfig) *Agent {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-		ResponseHeaderTimeout: 5 * time.Second,
+		Proxy:        nil, // Ollama is a configured local/LAN service; don't route it through ambient proxies.
+		DialContext:  (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns: 32, MaxIdleConnsPerHost: 8, IdleConnTimeout: 60 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 5 * time.Second,
 	}
-	a := &Agent{cfg: cfg, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}}
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	a := &Agent{cfg: cfg, client: client}
 	if cfg.AdvertiseURL != "" {
 		a.advertised = cfg.AdvertiseURL
 	} else {
@@ -190,7 +221,15 @@ func (a *Agent) modelsAt(ctx context.Context, base string) ([]ModelInfo, error) 
 	var body struct {
 		Models []any `json:"models"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	limited := io.LimitReader(resp.Body, 8*1024*1024+1)
+	b, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > 8*1024*1024 {
+		return nil, errors.New("Ollama tags response exceeded 8 MiB")
+	}
+	if err := json.Unmarshal(b, &body); err != nil {
 		return nil, err
 	}
 	models := []ModelInfo{}
@@ -262,12 +301,12 @@ func (a *Agent) register(ctx context.Context) bool {
 }
 
 type heartbeatPayload struct {
-	Node              string      `json:"node"`
-	CPU               float64     `json:"cpu"`
-	RAM               float64     `json:"ram"`
+	Node               string      `json:"node"`
+	CPU                float64     `json:"cpu"`
+	RAM                float64     `json:"ram"`
 	OllamaLANReachable bool        `json:"ollama_lan_reachable"`
-	Models            []string    `json:"models"`
-	ModelDetails      []ModelInfo `json:"model_details"`
+	Models             []string    `json:"models"`
+	ModelDetails       []ModelInfo `json:"model_details"`
 }
 
 // heartbeat sends one heartbeat. Returns "ok", "reregister" or "error".

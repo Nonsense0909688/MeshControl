@@ -195,7 +195,7 @@ function buildShell() {
   add(top, th, tk, ad);
   main.append(top); document.body.insertBefore(aside, view); document.body.insertBefore(main, view); main.append(view);
   const dlg = el("div");
-  dlg.innerHTML = '<dialog id="tokd"><form method="dialog"><h3>Admin token</h3><p class="empty">Needed when the controller sets ADMIN_TOKEN. Kept in this tab only.</p>' +
+  dlg.innerHTML = '<dialog id="tokd"><form method="dialog"><h3>Admin token</h3><p class="empty">Required to access the controller API. Kept in this tab only.</p>' +
     '<input id="tokin" type="password" autocomplete="off" placeholder="ADMIN_TOKEN"><div class="row"><button value="x">Cancel</button><button class="pri" id="toksave" value="ok">Save</button></div></form></dialog>' +
     '<dialog id="addd"><form method="dialog"><h3>Add a node</h3><p class="empty">Run this on the machine that hosts Ollama, with the same AGENT_TOKEN as the controller:</p>' +
     '<pre id="addcmd"></pre><div class="row"><span></span><button class="pri" value="x">Close</button></div></form></dialog>';

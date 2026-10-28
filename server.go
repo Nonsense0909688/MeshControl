@@ -17,31 +17,155 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type Server struct {
-	cfg    ControllerConfig
-	reg    *Registry
-	pulls  *PullManager
-	client *http.Client // proxy client: no overall timeout, streams can be long
-	web    string
+	cfg         ControllerConfig
+	reg         *Registry
+	pulls       *PullManager
+	client      *http.Client // proxy client: no overall timeout, streams can be long
+	web         string
+	sem         chan struct{} // bounded concurrent HTTP requests
+	activeMu    sync.Mutex
+	activeNodes map[string]int // in-flight proxy requests, including streams
+	metrics     serverMetrics
+}
+
+type serverMetrics struct {
+	httpRequests  atomic.Uint64
+	httpActive    atomic.Int64
+	httpRejected  atomic.Uint64
+	proxyRequests atomic.Uint64
+	proxyErrors   atomic.Uint64
 }
 
 func NewServer(cfg ControllerConfig, web string) *Server {
 	clock := time.Now
-	tr := &http.Transport{
-		DialContext:         (&net.Dialer{Timeout: cfg.ConnectTimeout}).DialContext,
-		MaxIdleConnsPerHost: 16,
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = 5 * time.Second
 	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 10 * time.Minute
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 8 * 1024 * 1024
+	}
+	if cfg.MaxConcurrentRequests <= 0 {
+		cfg.MaxConcurrentRequests = 256
+	}
+	tr := newSafeTransport(cfg)
 	return &Server{
 		cfg: cfg, web: web,
 		reg:    NewRegistry(cfg, clock),
 		pulls:  NewPullManager(cfg, clock),
-		client: &http.Client{Transport: tr},
+		client: &http.Client{Transport: tr, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		sem:    make(chan struct{}, cfg.MaxConcurrentRequests), activeNodes: map[string]int{},
 	}
+}
+
+// newSafeTransport revalidates every resolved IP at connection time. This
+// prevents hostname changes between registration and proxying from escaping
+// the controller's node-network allowlist (DNS rebinding). ResponseHeaderTimeout
+// uses READ_TIMEOUT so cold model loads can take longer than a short connect timeout.
+func newSafeTransport(cfg ControllerConfig) *http.Transport {
+	dialer := &net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		Proxy: nil, // never inherit ambient HTTP_PROXY settings for trusted node traffic
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, fmt.Errorf("invalid upstream address")
+			}
+			portN, err := net.LookupPort("tcp", port)
+			if err != nil || portN < 1 || portN > 65535 {
+				return nil, fmt.Errorf("invalid upstream port")
+			}
+			var ips []net.IP
+			if ip := net.ParseIP(host); ip != nil {
+				ips = []net.IP{ip}
+			} else {
+				resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil || len(resolved) == 0 {
+					return nil, fmt.Errorf("upstream hostname did not resolve")
+				}
+				for _, addr := range resolved {
+					ips = append(ips, addr.IP)
+				}
+			}
+			for _, ip := range ips {
+				if !ipAllowed(ip, cfg.AllowedNetworks) {
+					return nil, fmt.Errorf("upstream address outside allowed networks")
+				}
+			}
+			if len(cfg.AllowedNodePorts) > 0 && !cfg.AllowedNodePorts[portN] {
+				return nil, fmt.Errorf("upstream port is not in ALLOWED_NODE_PORTS")
+			}
+			var lastErr error
+			for _, ip := range ips {
+				conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), strconv.Itoa(portN)))
+				if dialErr == nil {
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
+		},
+		MaxIdleConns: 128, MaxIdleConnsPerHost: 16, MaxConnsPerHost: 64,
+		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second,
+		ResponseHeaderTimeout: cfg.ReadTimeout,
+		ForceAttemptHTTP2:     true,
+	}
+}
+
+// Active proxy counts are used by load-aware routing. A streamed response remains
+// active until the upstream stream finishes or the client disconnects.
+func (s *Server) beginNode(node string) {
+	s.activeMu.Lock()
+	s.activeNodes[node]++
+	s.activeMu.Unlock()
+}
+
+func (s *Server) endNode(node string) {
+	s.activeMu.Lock()
+	if s.activeNodes[node] <= 1 {
+		delete(s.activeNodes, node)
+	} else {
+		s.activeNodes[node]--
+	}
+	s.activeMu.Unlock()
+}
+
+func (s *Server) activeCount(node string) int {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	return s.activeNodes[node]
+}
+
+// orderCandidates prefers nodes with lower reported CPU/RAM utilization and
+// fewer active requests. Registry round-robin rotation remains the tie-breaker.
+func (s *Server) orderCandidates(cands []NodeView) []NodeView {
+	out := append([]NodeView(nil), cands...)
+	// Snapshot the score once: reading changing in-flight counters from a sort
+	// comparator could make its ordering inconsistent under concurrent traffic.
+	scores := make(map[string]float64, len(out))
+	for _, n := range out {
+		load := float64(s.activeCount(n.Node)) * 30
+		if n.CPU != nil {
+			load += *n.CPU * 0.6
+		}
+		if n.RAM != nil {
+			load += *n.RAM * 0.4
+		}
+		scores[n.Node] = load
+	}
+	sort.SliceStable(out, func(i, j int) bool { return scores[out[i].Node] < scores[out[j].Node] })
+	return out
 }
 
 // ---- JSON / error helpers -------------------------------------------------
@@ -58,7 +182,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func apiErr(w http.ResponseWriter, msg string, code int, kv ...any) {
 	m := map[string]any{"error": msg}
 	for i := 0; i+1 < len(kv); i += 2 {
-		m[kv[i].(string)] = kv[i+1]
+		key, ok := kv[i].(string)
+		if ok {
+			m[key] = kv[i+1]
+		}
 	}
 	writeJSON(w, code, m)
 }
@@ -131,20 +258,45 @@ func tokenOK(r *http.Request, expected string) bool {
 	return expected != "" && given != "" && subtle.ConstantTimeCompare([]byte(given), []byte(expected)) == 1
 }
 
+type agentIdentityContextKey struct{}
+
+func authenticatedAgentID(r *http.Request) string {
+	id, _ := r.Context().Value(agentIdentityContextKey{}).(string)
+	return id
+}
+
 func (s *Server) agentOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !tokenOK(r, s.cfg.AgentToken) {
-			apiErr(w, "unauthorized", http.StatusUnauthorized)
-			return
+		if len(s.cfg.AgentTokens) == 0 {
+			if !tokenOK(r, s.cfg.AgentToken) {
+				log.Debug("agent authentication failed", "path", r.URL.Path, "remote_ip", requestPeerIP(r))
+				apiErr(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		} else {
+			given := bearer(r)
+			identity := ""
+			for node, expected := range s.cfg.AgentTokens {
+				if given != "" && subtle.ConstantTimeCompare([]byte(given), []byte(expected)) == 1 {
+					identity = node
+				}
+			}
+			if identity == "" {
+				log.Debug("per-node agent authentication failed", "path", r.URL.Path, "remote_ip", requestPeerIP(r))
+				apiErr(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), agentIdentityContextKey{}, identity))
 		}
 		h(w, r)
 	}
 }
 
-// adminOnly is open when ADMIN_TOKEN is unset (trusted dev LAN only).
+// adminOnly fails closed. An empty ADMIN_TOKEN never silently turns the API open.
 func (s *Server) adminOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AdminToken != "" && !tokenOK(r, s.cfg.AdminToken) {
+		if !tokenOK(r, s.cfg.AdminToken) {
+			log.Debug("admin authentication failed", "path", r.URL.Path, "remote_ip", requestPeerIP(r))
 			apiErr(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -212,6 +364,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/agent/heartbeat", s.agentOnly(api(s.handleHeartbeat)))
 
 	// Node / model information.
+	mux.HandleFunc("GET /api/metrics", s.adminOnly(s.handleMetrics))
 	mux.HandleFunc("GET /api/nodes", s.adminOnly(s.handleListNodes))
 	mux.HandleFunc("GET /api/nodes/{node}", s.adminOnly(s.handleGetNode))
 	mux.HandleFunc("GET /api/nodes/{node}/models", s.adminOnly(s.handleNodeModels))
@@ -228,7 +381,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/ollama/api/tags", s.adminOnly(s.handleProxyTags))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { apiErr(w, "not found", http.StatusNotFound) })
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.metrics.httpRequests.Add(1)
+		select {
+		case s.sem <- struct{}{}:
+			s.metrics.httpActive.Add(1)
+			defer func() { s.metrics.httpActive.Add(-1); <-s.sem }()
+			mux.ServeHTTP(w, r)
+		case <-r.Context().Done():
+			return
+		default:
+			s.metrics.httpRejected.Add(1)
+			w.Header().Set("Retry-After", "1")
+			apiErr(w, "server is at capacity; retry shortly", http.StatusServiceUnavailable)
+		}
+	})
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -243,6 +410,33 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"status": "ok", "nodes_online": online})
 }
 
+// handleMetrics exports low-cardinality Prometheus text metrics. The endpoint
+// is admin-authenticated like the rest of the control-plane API.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	nodes := s.reg.Snapshot()
+	online := 0
+	for _, n := range nodes {
+		if n.Online {
+			online++
+		}
+	}
+	s.activeMu.Lock()
+	proxyActive := 0
+	for _, count := range s.activeNodes {
+		proxyActive += count
+	}
+	s.activeMu.Unlock()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_http_requests_total Total requests received by the controller.\n# TYPE meshcontrol_http_requests_total counter\nmeshcontrol_http_requests_total %d\n", s.metrics.httpRequests.Load())
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_http_active_requests Requests currently admitted by the concurrency limiter.\n# TYPE meshcontrol_http_active_requests gauge\nmeshcontrol_http_active_requests %d\n", s.metrics.httpActive.Load())
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_http_capacity_rejections_total Requests rejected by the concurrency limiter.\n# TYPE meshcontrol_http_capacity_rejections_total counter\nmeshcontrol_http_capacity_rejections_total %d\n", s.metrics.httpRejected.Load())
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_proxy_requests_total Requests passed to an Ollama upstream.\n# TYPE meshcontrol_proxy_requests_total counter\nmeshcontrol_proxy_requests_total %d\n", s.metrics.proxyRequests.Load())
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_proxy_errors_total Proxy requests that failed before a response was relayed.\n# TYPE meshcontrol_proxy_errors_total counter\nmeshcontrol_proxy_errors_total %d\n", s.metrics.proxyErrors.Load())
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_proxy_active_requests Active upstream requests, including streams.\n# TYPE meshcontrol_proxy_active_requests gauge\nmeshcontrol_proxy_active_requests %d\n", proxyActive)
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_nodes_known Current registered nodes.\n# TYPE meshcontrol_nodes_known gauge\nmeshcontrol_nodes_known %d\n", len(nodes))
+	_, _ = fmt.Fprintf(w, "# HELP meshcontrol_nodes_online Current nodes with fresh heartbeats.\n# TYPE meshcontrol_nodes_online gauge\nmeshcontrol_nodes_online %d\n", online)
+}
+
 func agentJSON(r *http.Request) (map[string]any, error) {
 	if r.ContentLength > agentBodyLimit {
 		return nil, verr("request body too large")
@@ -254,22 +448,44 @@ func agentJSON(r *http.Request) (map[string]any, error) {
 	return m, err
 }
 
-func (s *Server) checkSourceIP(r *http.Request, rawURL string) error {
-	if !s.cfg.VerifySourceIP {
-		return nil
-	}
-	host := ""
-	if u, err := url.Parse(rawURL); err == nil {
-		host = u.Hostname()
-	}
+func requestPeerIP(r *http.Request) string {
 	remote, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remote = r.RemoteAddr
 	}
-	if host != remote {
-		return verr("ollama_url host does not match the agent's source address")
+	if ip := net.ParseIP(remote); ip != nil {
+		return ip.String()
 	}
-	return nil
+	return ""
+}
+
+func (s *Server) checkSourceIP(r *http.Request, rawURL string) error {
+	if !s.cfg.VerifySourceIP {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return verr("invalid Ollama URL")
+	}
+	peer := net.ParseIP(requestPeerIP(r))
+	if peer == nil {
+		return verr("cannot identify agent source address")
+	}
+	ip := net.ParseIP(u.Hostname())
+	if ip != nil && ip.Equal(peer) {
+		return nil
+	}
+	if ip == nil && s.cfg.AllowHostnames {
+		addrs, err := net.DefaultResolver.LookupIPAddr(r.Context(), u.Hostname())
+		if err == nil {
+			for _, a := range addrs {
+				if a.IP.Equal(peer) {
+					return nil
+				}
+			}
+		}
+	}
+	return verr("ollama_url host does not match the agent's source address")
 }
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) error {
@@ -281,6 +497,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if identity := authenticatedAgentID(r); identity != "" && identity != node {
+		return verr("node ID does not match the authenticated agent credential")
+	}
 	u, err := validateOllamaURL(data["ollama_url"], s.cfg)
 	if err != nil {
 		return err
@@ -288,7 +507,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) error {
 	if err := s.checkSourceIP(r, u); err != nil {
 		return err
 	}
-	created := s.reg.Register(node, u)
+	created, err := s.reg.RegisterFrom(node, u, requestPeerIP(r))
+	if err != nil {
+		return err
+	}
 	state := "re-registered"
 	code := 200
 	if created {
@@ -307,6 +529,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) error {
 	node, err := validateNodeID(data["node"])
 	if err != nil {
 		return err
+	}
+	if identity := authenticatedAgentID(r); identity != "" && identity != node {
+		return verr("node ID does not match the authenticated agent credential")
 	}
 	cpu, err := validatePercent(data["cpu"], "cpu")
 	if err != nil {
@@ -328,7 +553,11 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if !s.reg.Heartbeat(node, cpu, ram, reachable, models, details) {
+	ok, hbErr := s.reg.HeartbeatFrom(node, requestPeerIP(r), cpu, ram, reachable, models, details)
+	if hbErr != nil {
+		return hbErr
+	}
+	if !ok {
 		// Typical after a controller restart: tell the agent to register again.
 		apiErr(w, "node not registered", 404, "reregister", true)
 		return nil
@@ -409,9 +638,17 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) error {
 		apiErr(w, fmt.Sprintf("provider unreachable on node '%s'", node), 503, "status", "provider_unreachable")
 		return nil
 	}
-	job, started := s.pulls.Start(node, rec.OllamaURL, model)
+	job, started, reason := s.pulls.StartDetailed(node, rec.OllamaURL, model)
 	if !started {
-		apiErr(w, fmt.Sprintf("'%s' is already being pulled on '%s'", model, node), 409)
+		switch reason {
+		case "global_limit", "node_limit":
+			w.Header().Set("Retry-After", "5")
+			apiErr(w, "model-pull capacity reached; retry shortly", http.StatusTooManyRequests, "reason", reason)
+		case "random_failure":
+			apiErr(w, "could not generate a pull job identifier", http.StatusInternalServerError)
+		default:
+			apiErr(w, fmt.Sprintf("'%s' is already being pulled on '%s'", model, node), http.StatusConflict)
+		}
 		return nil
 	}
 	log.Info("pull started", "model", model, "node", node)
@@ -424,12 +661,14 @@ func (s *Server) handleListPulls(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancelPull(w http.ResponseWriter, r *http.Request) {
-	switch s.pulls.Cancel(r.PathValue("pull_id")) {
+	id := r.PathValue("pull_id")
+	switch s.pulls.Cancel(id) {
 	case "missing":
 		apiErr(w, "pull not found", 404)
 	case "finished":
 		apiErr(w, "pull already finished", 409)
 	default:
+		log.Info("pull cancellation requested", "pull_id", id)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	}
 }
@@ -437,6 +676,11 @@ func (s *Server) handleCancelPull(w http.ResponseWriter, r *http.Request) {
 // ---- proxy ----------------------------------------------------------------
 
 func (s *Server) handleProxyAuto(w http.ResponseWriter, r *http.Request) error {
+
+	if r.Header.Get("Content-Type") != "application/json" {
+		return fmt.Errorf("unsupported Content-Type: expected application/json")
+	}
+
 	endpoint := r.PathValue("endpoint")
 	if !proxyEndpoints[endpoint] {
 		apiErr(w, "not found", 404)
@@ -446,6 +690,7 @@ func (s *Server) handleProxyAuto(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+
 	obj, err := parseObject(body)
 	if err != nil {
 		return err
@@ -482,6 +727,10 @@ func (s *Server) handleProxyDirect(w http.ResponseWriter, r *http.Request) error
 		apiErr(w, fmt.Sprintf("node '%s' is offline", node), 503)
 		return nil
 	}
+	if !rec.OllamaLANReachable {
+		apiErr(w, fmt.Sprintf("provider unreachable on node '%s'", node), 503)
+		return nil
+	}
 	body, err := readBody(r, s.cfg.MaxBodyBytes)
 	if err != nil {
 		return err
@@ -493,7 +742,7 @@ func (s *Server) handleProxyDirect(w http.ResponseWriter, r *http.Request) error
 func (s *Server) handleProxyTags(w http.ResponseWriter, r *http.Request) {
 	byModel := map[string][]string{}
 	for _, n := range s.reg.Snapshot() {
-		if n.Online {
+		if n.Online && n.OllamaLANReachable {
 			for _, m := range n.Models {
 				byModel[m] = append(byModel[m], n.Node)
 			}
@@ -517,14 +766,19 @@ func (s *Server) handleProxyTags(w http.ResponseWriter, r *http.Request) {
 // the request provably never left (a dial failure); anything later could mean
 // inference already started, and non-idempotent requests must not be replayed.
 func (s *Server) forward(w http.ResponseWriter, r *http.Request, cands []NodeView, endpoint string, body []byte) {
+	s.metrics.proxyRequests.Add(1)
 	lastErr := "no upstream attempted"
+	cands = s.orderCandidates(cands)
 	for _, rec := range cands {
+		s.beginNode(rec.Node)
 		ctx, cancel := context.WithCancel(r.Context())
 		idle := newIdle(s.cfg.ReadTimeout, cancel)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, rec.OllamaURL+"/api/"+endpoint, bytes.NewReader(body))
 		if err != nil {
 			idle.stop()
 			cancel()
+			s.endNode(rec.Node)
+			s.metrics.proxyErrors.Add(1)
 			apiErr(w, "error talking to node "+rec.Node, 502)
 			return
 		}
@@ -534,6 +788,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, cands []NodeVie
 			timedOut := idle.fired.Load()
 			idle.stop()
 			cancel()
+			s.endNode(rec.Node)
 			if r.Context().Err() != nil {
 				return // client went away
 			}
@@ -544,15 +799,21 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, cands []NodeVie
 				continue
 			}
 			if timedOut {
+				s.metrics.proxyErrors.Add(1)
 				apiErr(w, fmt.Sprintf("node %s timed out", rec.Node), 504)
 				return
 			}
+			s.metrics.proxyErrors.Add(1)
 			apiErr(w, "error talking to node "+rec.Node, 502)
 			return
 		}
-		s.relay(w, r, resp, rec.Node, idle, cancel)
+		func() {
+			defer s.endNode(rec.Node)
+			s.relay(w, r, resp, rec.Node, idle, cancel)
+		}()
 		return
 	}
+	s.metrics.proxyErrors.Add(1)
 	apiErr(w, lastErr, 502)
 }
 
@@ -600,22 +861,48 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 
 // ---- entry point ----------------------------------------------------------
 
+func controllerListenAddress() (string, error) {
+	host := strings.TrimSpace(envOr("CONTROLLER_HOST", "127.0.0.1"))
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if host == "" || strings.ContainsAny(host, "/\\[] \t\r\n") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
+		return "", fmt.Errorf("CONTROLLER_HOST is invalid")
+	}
+	port, err := strconv.Atoi(envOr("CONTROLLER_PORT", "8000"))
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("CONTROLLER_PORT must be between 1 and 65535")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
 func runController() int {
 	cfg, err := controllerConfigFromEnv()
 	if err != nil {
 		log.Error(err.Error())
 		return 1
 	}
-	if cfg.AdminToken == "" {
-		log.Warn("ADMIN_TOKEN is not set: node/model/proxy endpoints are unauthenticated")
-	}
-	web := envOr("WEB_DIR", ".")
-	if _, err := os.Stat(web); err != nil {
-		log.Error("WEB_DIR not found", "dir", web)
+	web := envOr("WEB_DIR", "./web")
+	info, err := os.Stat(web)
+	if err != nil || !info.IsDir() {
+		log.Error("WEB_DIR is missing or not a directory", "dir", web)
 		return 1
 	}
-	addr := net.JoinHostPort(envOr("CONTROLLER_HOST", "0.0.0.0"), envOr("CONTROLLER_PORT", "8000"))
-	srv := &http.Server{Addr: addr, Handler: NewServer(cfg, web).Handler(), ReadHeaderTimeout: 10 * time.Second}
+	addr, err := controllerListenAddress()
+	if err != nil {
+		log.Error(err.Error())
+		return 1
+	}
+	certFile, keyFile, err := controllerTLSFromEnv()
+	if err != nil {
+		log.Error(err.Error())
+		return 1
+	}
+	srv := &http.Server{
+		Addr: addr, Handler: NewServer(cfg, web).Handler(),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -628,9 +915,19 @@ func runController() int {
 		}
 	}()
 
-	log.Info("MeshControl controller listening", "addr", addr, "web", web)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Error("server error", "error", err.Error())
+	transport := "http"
+	if certFile != "" {
+		transport = "https"
+	}
+	log.Info("MeshControl controller listening", "addr", addr, "transport", transport, "web", web)
+	var serveErr error
+	if certFile != "" {
+		serveErr = srv.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		log.Error("server error", "error", serveErr.Error())
 		return 1
 	}
 	return 0

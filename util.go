@@ -31,6 +31,21 @@ func envBool(key string, def bool) bool {
 	return false
 }
 
+func envBoolChecked(key string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return def, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid %s: expected true/false", key)
+	}
+}
+
 func envFloat(key string, def float64) (float64, error) {
 	f, err := strconv.ParseFloat(envOr(key, strconv.FormatFloat(def, 'f', -1, 64)), 64)
 	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
